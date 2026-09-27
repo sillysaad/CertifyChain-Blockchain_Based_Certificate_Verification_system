@@ -1,0 +1,2713 @@
+﻿CERTIFYCHAIN: FULL PROJECT EXPLANATION AND CODEBASE
+======================================================================
+This project is a decentralized application (dApp) built to issue and verify certificates on a local Ethereum blockchain (Ganache).
+
+Project Architecture:
+1. Smart Contract: Written in Solidity, deployed to local Ganache. Manages storing Hashes.
+2. Backend (Node.js/Express): Handles Tesseract OCR extraction, IPFS interactions (mocked), and blockchain queries via ethers.js.
+3. Frontend (React/Vite): Contains the UI with a Dark Glassmorphism theme, Web3 wallet connection, and role-based portals (Admin/Student/Verifier).
+
+Below is the complete codebase with file-by-file explanations.
+======================================================================
+
+======================================================================
+
+FILE: start.ps1
+
+EXPLANATION: Master startup script that boots Ganache, compiles the contract via solc, runs the deployment script, and starts both backend and frontend.
+
+======================================================================
+
+
+# CertifyChain - One-Click Startup Script
+# Run from the blockchain-cert-app root folder:
+#   .\start.ps1
+
+$ErrorActionPreference = "Stop"
+$root = $PSScriptRoot
+
+Write-Host ""
+Write-Host "========================================================" -ForegroundColor Cyan
+Write-Host "  CertifyChain - Blockchain Certificate Verification" -ForegroundColor Cyan
+Write-Host "========================================================" -ForegroundColor Cyan
+Write-Host ""
+
+# -- Step 1: Start Ganache --------------------------------------------------
+Write-Host "[1/5] Starting local Ganache blockchain on port 8545..." -ForegroundColor Yellow
+$ganache = Start-Process powershell -ArgumentList "-NoExit", "-Command", `
+    "npx -y ganache -p 8545 -m 'test test test test test test test test test test test junk'" `
+    -WorkingDirectory "$root\backend" -PassThru
+Start-Sleep -Seconds 4
+Write-Host "      [OK] Ganache started (PID $($ganache.Id))" -ForegroundColor Green
+
+# -- Step 2: Compile Smart Contract ----------------------------------------
+Write-Host "[2/5] Compiling CertificateRegistry.sol..." -ForegroundColor Yellow
+if (Test-Path "$root\smart_contracts\compiled") {
+    Remove-Item -Recurse -Force "$root\smart_contracts\compiled"
+}
+$compile = Start-Process powershell -ArgumentList "-Command", `
+    "npx -y solc@0.8.24 --abi --bin --base-path . contracts/CertificateRegistry.sol -o compiled; Write-Host '[OK] Compiled!' -ForegroundColor Green; Start-Sleep -Seconds 2" `
+    -WorkingDirectory "$root\smart_contracts" -PassThru -Wait
+Start-Sleep -Seconds 2
+Write-Host "      [OK] Contract compiled" -ForegroundColor Green
+
+# -- Step 3: Deploy Contract ------------------------------------------------
+Write-Host "[3/5] Deploying contract to local blockchain..." -ForegroundColor Yellow
+Push-Location "$root\backend"
+node deploy.js
+Pop-Location
+Write-Host "      [OK] Contract deployed and address saved to backend\.env" -ForegroundColor Green
+
+# -- Step 4: Start Backend --------------------------------------------------
+Write-Host "[4/5] Starting Express backend on http://localhost:5000..." -ForegroundColor Yellow
+$backend = Start-Process powershell -ArgumentList "-NoExit", "-Command", `
+    "node server.js" `
+    -WorkingDirectory "$root\backend" -PassThru
+Start-Sleep -Seconds 3
+Write-Host "      [OK] Backend running (PID $($backend.Id))" -ForegroundColor Green
+
+# -- Step 5: Start Frontend -------------------------------------------------
+Write-Host "[5/5] Starting React frontend on http://localhost:5173..." -ForegroundColor Yellow
+$frontend = Start-Process powershell -ArgumentList "-NoExit", "-Command", `
+    "npm run dev" `
+    -WorkingDirectory "$root\frontend" -PassThru
+Start-Sleep -Seconds 3
+Write-Host "      [OK] Frontend running (PID $($frontend.Id))" -ForegroundColor Green
+
+Write-Host ""
+Write-Host "========================================================" -ForegroundColor Cyan
+Write-Host "  [OK] CertifyChain is RUNNING!" -ForegroundColor Green
+Write-Host "========================================================" -ForegroundColor Cyan
+Write-Host ""
+Write-Host "  Frontend    ->  http://localhost:5173" -ForegroundColor White
+Write-Host "  Backend     ->  http://localhost:5000/api/health" -ForegroundColor White
+Write-Host "  Blockchain  ->  http://localhost:8545" -ForegroundColor White
+Write-Host ""
+Write-Host "  Admin Portal   ->  http://localhost:5173/admin" -ForegroundColor White
+Write-Host "  Verify Portal  ->  http://localhost:5173" -ForegroundColor White
+Write-Host ""
+Write-Host "Opening up browser..." -ForegroundColor Gray
+Start-Process "http://localhost:5173"
+
+
+
+======================================================================
+
+FILE: smart_contracts\contracts\CertificateRegistry.sol
+
+EXPLANATION: The Solidity smart contract. It maps file hashes to certificate data and ensures only the administrator can issue certificates.
+
+======================================================================
+
+
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.24;
+
+contract CertificateRegistry {
+    address public admin;
+
+    struct Certificate {
+        string certificateId;
+        string studentName;
+        string course;
+        string ipfsHash;
+        string fileHash;
+        uint256 timestamp;
+        bool isValid;
+    }
+
+    // Primary lookup: fileHash  → Certificate
+    mapping(string => Certificate) private certsByHash;
+
+    // Secondary lookup: certificateId → fileHash (for QR code / ID-based lookup)
+    mapping(string => string) private hashByCertId;
+
+    event CertificateIssued(string fileHash, string certificateId, string studentName);
+
+    modifier onlyAdmin() {
+        require(msg.sender == admin, "Only admin can perform this action");
+        _;
+    }
+
+    constructor() {
+        admin = msg.sender;
+    }
+
+    /// @notice Issue a certificate — only callable by admin
+    function issueCertificate(
+        string memory _fileHash,
+        string memory _certificateId,
+        string memory _studentName,
+        string memory _course,
+        string memory _ipfsHash
+    ) public onlyAdmin {
+        require(!certsByHash[_fileHash].isValid, "Certificate with this file hash already exists");
+        require(bytes(hashByCertId[_certificateId]).length == 0, "Certificate ID already registered");
+
+        certsByHash[_fileHash] = Certificate({
+            certificateId: _certificateId,
+            studentName: _studentName,
+            course: _course,
+            ipfsHash: _ipfsHash,
+            fileHash: _fileHash,
+            timestamp: block.timestamp,
+            isValid: true
+        });
+
+        // Enable ID-based lookup (for QR verification)
+        hashByCertId[_certificateId] = _fileHash;
+
+        emit CertificateIssued(_fileHash, _certificateId, _studentName);
+    }
+
+    /// @notice Verify by file hash (primary method — used after hashing uploaded file)
+    function verifyCertificate(string memory _fileHash) public view returns (
+        bool isValid,
+        string memory certificateId,
+        string memory studentName,
+        string memory course,
+        string memory ipfsHash,
+        uint256 timestamp
+    ) {
+        Certificate memory cert = certsByHash[_fileHash];
+        if (cert.isValid) {
+            return (true, cert.certificateId, cert.studentName, cert.course, cert.ipfsHash, cert.timestamp);
+        }
+        return (false, "", "", "", "", 0);
+    }
+
+    /// @notice Get stored file hash by certificate ID (used for QR code verification)
+    function getHashByCertId(string memory _certificateId) public view returns (string memory fileHash) {
+        return hashByCertId[_certificateId];
+    }
+
+    /// @notice Get full certificate details by certificate ID (for QR display)
+    function getCertificateById(string memory _certificateId) public view returns (
+        bool isValid,
+        string memory certificateId,
+        string memory studentName,
+        string memory course,
+        string memory ipfsHash,
+        string memory fileHash,
+        uint256 timestamp
+    ) {
+        string memory hash = hashByCertId[_certificateId];
+        if (bytes(hash).length == 0) {
+            return (false, "", "", "", "", "", 0);
+        }
+        Certificate memory cert = certsByHash[hash];
+        return (cert.isValid, cert.certificateId, cert.studentName, cert.course, cert.ipfsHash, cert.fileHash, cert.timestamp);
+    }
+}
+
+
+
+======================================================================
+
+FILE: backend\deploy.js
+
+EXPLANATION: Deploys the compiled smart contract ABI/BIN to Ganache using ethers.js and the default private key, then sets the address in the .env file.
+
+======================================================================
+
+
+const fs = require('fs');
+const path = require('path');
+const ethers = require('ethers');
+
+async function deploy() {
+    const compiledDir = path.join(__dirname, '../smart_contracts/compiled');
+    const files = fs.readdirSync(compiledDir);
+
+    // Find the ABI and BIN files
+    const abiFile = files.find(f => f.endsWith('.abi'));
+    const binFile = files.find(f => f.endsWith('.bin'));
+
+    if (!abiFile || !binFile) {
+        console.error('ERROR: Could not find compiled .abi or .bin files in', compiledDir);
+        console.error('Files found:', files);
+        process.exit(1);
+    }
+
+    console.log('Using compiled files:', abiFile, binFile);
+
+    const abi = JSON.parse(fs.readFileSync(path.join(compiledDir, abiFile), 'utf8'));
+    const bytecode = fs.readFileSync(path.join(compiledDir, binFile), 'utf8').trim();
+
+    // Connect to local Ganache (running on 8545)
+    const provider = new ethers.JsonRpcProvider('http://127.0.0.1:8545');
+
+    // Use Ganache's default first account private key (from the mnemonic "test test test...")
+    const privateKey = '0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80';
+    const wallet = new ethers.Wallet(privateKey, provider);
+
+    console.log('Deploying with wallet:', wallet.address);
+
+    const factory = new ethers.ContractFactory(abi, bytecode, wallet);
+    console.log('Deploying CertificateRegistry...');
+    
+    const contract = await factory.deploy();
+    await contract.waitForDeployment();
+    
+    const address = await contract.getAddress();
+    console.log('SUCCESS! CertificateRegistry deployed at:', address);
+
+    // Write address to .env file
+    const envPath = path.join(__dirname, '.env');
+    let envContent = fs.existsSync(envPath) ? fs.readFileSync(envPath, 'utf8') : '';
+
+    if (envContent.includes('CONTRACT_ADDRESS=')) {
+        envContent = envContent.replace(/CONTRACT_ADDRESS=.*/, `CONTRACT_ADDRESS=${address}`);
+    } else {
+        envContent += `\nCONTRACT_ADDRESS=${address}`;
+    }
+
+    fs.writeFileSync(envPath, envContent);
+    console.log('.env updated with CONTRACT_ADDRESS =', address);
+    return address;
+}
+
+deploy().catch(err => {
+    console.error('Deploy failed:', err.message);
+    process.exit(1);
+});
+
+
+
+======================================================================
+
+FILE: backend\server.js
+
+EXPLANATION: Express backend entry point. Has endpoints for /api/admin/prepare-issue, /api/verify, and /api/verify-qr. Imports other services to process hashing and OCR.
+
+======================================================================
+
+
+require('dotenv').config();
+const express = require('express');
+const cors = require('cors');
+const multer = require('multer');
+const QRCode = require('qrcode');
+const { pinFileToIPFS, getFileHash } = require('./mockIpfs');
+const { extractCertificateId } = require('./ocrService');
+const { issueOnBlockchain, verifyByFileHash, getHashByCertId, getCertificateById, abi } = require('./smartContractService');
+
+const app = express();
+app.use(cors());
+app.use(express.json());
+
+const upload = multer({ storage: multer.memoryStorage() });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ALGORITHM: Certificate Prep (File verification -> Hash -> IPFS -> QR)
+// ─────────────────────────────────────────────────────────────────────────────
+app.post('/api/admin/prepare-issue', upload.single('certificate'), async (req, res) => {
+    try {
+        if (!req.file) return res.status(400).json({ success: false, error: 'No file provided' });
+
+        const { studentName, course, certificateId } = req.body;
+        if (!studentName || !course || !certificateId) {
+            return res.status(400).json({ success: false, error: 'studentName, course, and certificateId are required' });
+        }
+
+        // Generate SHA-256 hash of the certificate file
+        const { cid, fileHash } = await pinFileToIPFS(req.file.buffer);
+        console.log(`[Prepare Issue] SHA-256 hash = ${fileHash}, IPFS CID = ${cid}`);
+
+        // Generate QR Code → encodes the Certificate ID for fast retrieval
+        const qrData = `certid:${certificateId}`;
+        const qrCodeDataUrl = await QRCode.toDataURL(qrData, { width: 200, margin: 1 });
+        console.log(`[Prepare Issue] QR code generated for cert ID = ${certificateId}`);
+
+        res.json({
+            success: true,
+            fileHash,
+            ipfsHash: cid,
+            qrCode: qrCodeDataUrl,
+            message: 'File processing complete. Ready for MetaMask signature.'
+        });
+
+    } catch (error) {
+        console.error('[Prepare Issue] Error:', error.message);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ALGORITHM: Certificate Verification (Image Upload)
+// Step 1: User uploads certificate image
+// Step 2: Apply OCR using Tesseract → extract Certificate ID
+// Step 3: Generate SHA-256 hash of uploaded file
+// Step 4: Fetch stored hash from Blockchain using Certificate ID
+// Step 5: Compare Generated Hash == Stored Hash
+//         → VALID if match, FAKE if not
+// Step 6: Display result
+// ─────────────────────────────────────────────────────────────────────────────
+app.post('/api/verify', upload.single('certificate'), async (req, res) => {
+    try {
+        if (!req.file) return res.status(400).json({ success: false, error: 'No file provided' });
+
+        // STEP 3: Generate SHA-256 hash of uploaded file
+        const generatedHash = getFileHash(req.file.buffer);
+        console.log(`[Verify] Step 3: Generated hash = ${generatedHash.substring(0, 16)}...`);
+
+        let extractedId = null;
+        let ocrText = '';
+
+        // STEP 2: Apply OCR for images to extract Certificate ID
+        if (req.file.mimetype.startsWith('image/')) {
+            try {
+                console.log('[Verify] Step 2: Running OCR...');
+                const ocrResult = await extractCertificateId(req.file.buffer);
+                extractedId = ocrResult.extractedId;
+                ocrText = ocrResult.text ? ocrResult.text.trim().substring(0, 300) : '';
+                console.log(`[Verify] Step 2: OCR extracted ID = "${extractedId}"`);
+            } catch (ocrErr) {
+                console.warn('[Verify] OCR failed (non-critical):', ocrErr.message);
+            }
+        }
+
+        // STEP 4 & 5: Determine result
+        // Primary path: look up blockchain by GENERATED HASH (most reliable — exact file match)
+        const blockchainData = await verifyByFileHash(generatedHash);
+
+        let isAuthentic = false;
+        let reason = '';
+        let ocrMatch = 'N/A';
+        let certData = null;
+
+        if (blockchainData.isValid) {
+            // Hash matched on chain → VALID
+            isAuthentic = true;
+            certData = blockchainData;
+            console.log('[Verify] Step 5: Hash matched blockchain → VALID');
+
+            // Also cross-check OCR ID vs stored ID
+            if (extractedId) {
+                ocrMatch = extractedId === blockchainData.certificateId
+                    ? `✓ OCR ID matched (${extractedId})`
+                    : `⚠ OCR ID mismatch — OCR: "${extractedId}", Chain: "${blockchainData.certificateId}"`;
+            }
+        } else {
+            // Hash not found — try lookup by OCR-extracted Certificate ID
+            // Step 4: Fetch stored HASH from blockchain using extracted Certificate ID
+            if (extractedId) {
+                console.log(`[Verify] Step 4: Hash not found, trying lookup by OCR cert ID = "${extractedId}"`);
+                const storedHash = await getHashByCertId(extractedId);
+
+                if (storedHash && storedHash.length > 0) {
+                    // Step 5: Compare generated hash vs stored hash
+                    if (generatedHash === storedHash) {
+                        // Should not normally reach here (already checked above), but handles edge cases
+                        isAuthentic = true;
+                        const certById = await getCertificateById(extractedId);
+                        certData = certById;
+                        ocrMatch = `✓ OCR ID matched and hash verified (${extractedId})`;
+                        console.log('[Verify] Step 5: Hash matched via cert ID → VALID');
+                    } else {
+                        isAuthentic = false;
+                        reason = `Certificate ID "${extractedId}" exists on blockchain, but the FILE HAS BEEN TAMPERED — hash does not match.`;
+                        ocrMatch = `✗ Hash mismatch: generated vs stored`;
+                        console.log('[Verify] Step 5: Cert ID found but hash mismatch → FAKE/TAMPERED');
+                    }
+                } else {
+                    isAuthentic = false;
+                    reason = extractedId
+                        ? `Certificate ID "${extractedId}" not found on blockchain.`
+                        : 'File hash not found on blockchain — certificate was not issued or has been tampered with.';
+                    console.log('[Verify] Step 5: Not found on blockchain → FAKE');
+                }
+            } else {
+                isAuthentic = false;
+                reason = 'File hash not found on blockchain.';
+            }
+        }
+
+        res.json({
+            success: true,
+            isAuthentic,
+            reason: isAuthentic ? null : reason,
+            message: isAuthentic
+                ? '✅ Certificate is VALID — confirmed on the blockchain.'
+                : '❌ Certificate is FAKE or TAMPERED.',
+            generatedHash,
+            extractedId,
+            ocrText,
+            ocrMatch,
+            certificateData: certData
+        });
+
+    } catch (error) {
+        console.error('[Verify] Error:', error.message);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ALGORITHM: QR Code Verification
+// Step 1: Scan QR Code → extract Certificate ID
+// Step 2: Fetch certificate details from Blockchain using Certificate ID
+// Step 3: Display Student Name, Course, Status
+// ─────────────────────────────────────────────────────────────────────────────
+app.get('/api/verify-qr/:certificateId', async (req, res) => {
+    try {
+        const { certificateId } = req.params;
+        console.log(`[QR Verify] Looking up cert ID = "${certificateId}"`);
+
+        const certData = await getCertificateById(certificateId);
+
+        if (!certData.isValid) {
+            return res.json({
+                success: true,
+                isAuthentic: false,
+                message: `❌ Certificate ID "${certificateId}" not found on blockchain.`
+            });
+        }
+
+        res.json({
+            success: true,
+            isAuthentic: true,
+            message: '✅ Certificate is VALID — confirmed on the blockchain.',
+            certificateData: certData
+        });
+
+    } catch (error) {
+        console.error('[QR Verify] Error:', error.message);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// Health check
+app.get('/api/health', (req, res) => {
+    res.json({ ok: true, contractAddress: process.env.CONTRACT_ADDRESS || 'NOT SET' });
+});
+
+app.get('/api/contract-info', (req, res) => {
+    res.json({
+        success: true,
+        address: process.env.CONTRACT_ADDRESS,
+        abi: abi
+    });
+});
+
+const PORT = process.env.PORT || 5000;
+app.listen(PORT, () => {
+    console.log(`✅ CertifyChain Backend on http://localhost:${PORT}`);
+    console.log(`   Contract: ${process.env.CONTRACT_ADDRESS || 'NOT SET'}`);
+});
+
+
+
+======================================================================
+
+FILE: backend\smartContractService.js
+
+EXPLANATION: Reads the deployed smart contract using the .env address and ethers.js. Provides utility functions to the API for querying isAuthentic and fetching details.
+
+======================================================================
+
+
+require('dotenv').config();
+const fs = require('fs');
+const path = require('path');
+const ethers = require('ethers');
+
+// Load ABI from compiled output
+const compiledDir = path.join(__dirname, '../smart_contracts/compiled');
+const abiFile = fs.readdirSync(compiledDir).find(f => f.endsWith('.abi'));
+const abi = JSON.parse(fs.readFileSync(path.join(compiledDir, abiFile), 'utf8'));
+
+const provider = new ethers.JsonRpcProvider('http://127.0.0.1:8545');
+// Ganache default account #0 (funded)
+const adminPrivateKey = '0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80';
+const wallet = new ethers.Wallet(adminPrivateKey, provider);
+
+function getContract() {
+    const contractAddress = process.env.CONTRACT_ADDRESS;
+    if (!contractAddress) throw new Error('CONTRACT_ADDRESS not set. Run: node deploy.js');
+    return new ethers.Contract(contractAddress, abi, wallet);
+}
+
+// ── Issue Certificate on Blockchain ───────────────────────────────────────────
+async function issueOnBlockchain(fileHash, certificateId, studentName, course, ipfsHash) {
+    const contract = getContract();
+    console.log(`[Blockchain] Issuing cert ID="${certificateId}" fileHash="${fileHash.substring(0,16)}..."`);
+    const tx = await contract.issueCertificate(fileHash, certificateId, studentName, course, ipfsHash);
+    const receipt = await tx.wait();
+    return { transactionHash: receipt.hash, success: true };
+}
+
+// ── Verify by File Hash (primary path) ────────────────────────────────────────
+async function verifyByFileHash(fileHash) {
+    const contract = getContract();
+    const result = await contract.verifyCertificate(fileHash);
+    return {
+        isValid: result.isValid,
+        certificateId: result.certificateId,
+        studentName: result.studentName,
+        course: result.course,
+        ipfsHash: result.ipfsHash,
+        timestamp: result.timestamp.toString()
+    };
+}
+
+// ── Get stored file hash by Certificate ID (used in OCR/QR verify path) ───────
+async function getHashByCertId(certificateId) {
+    const contract = getContract();
+    const storedHash = await contract.getHashByCertId(certificateId);
+    return storedHash; // returns empty string if not found
+}
+
+// ── Get full certificate details by Certificate ID (QR code scan) ─────────────
+async function getCertificateById(certificateId) {
+    const contract = getContract();
+    const result = await contract.getCertificateById(certificateId);
+    return {
+        isValid: result.isValid,
+        certificateId: result.certificateId,
+        studentName: result.studentName,
+        course: result.course,
+        ipfsHash: result.ipfsHash,
+        fileHash: result.fileHash,
+        timestamp: result.timestamp.toString()
+    };
+}
+
+module.exports = { issueOnBlockchain, verifyByFileHash, getHashByCertId, getCertificateById, abi };
+
+
+
+======================================================================
+
+FILE: backend\ocrService.js
+
+EXPLANATION: Uses Tesseract.js to read text from uploaded certificate images and attempts to extract a Certificate ID.
+
+======================================================================
+
+
+const Tesseract = require('tesseract.js');
+
+/**
+ * Extracts text from an image buffer and attempts to find a Certificate ID.
+ * Since this is generic, we'll look for simple patterns like "ID: 12345" 
+ * or just return the raw text if we can't cleanly parse it.
+ */
+async function extractCertificateId(imageBuffer) {
+    try {
+        const result = await Tesseract.recognize(imageBuffer, 'eng');
+        const text = result.data.text;
+        
+        // Simple regex to find something like "Certificate ID: <ID>" or "ID: <ID>"
+        // This regex looks for "id:", "id ", "ID -", etc., followed by alphanumeric string.
+        const idRegex = /(?:certificate\s+id|id)[\s\:\-]+([A-Z0-9\-]+)/i;
+        const match = text.match(idRegex);
+
+        let extractedId = null;
+        if (match && match[1]) {
+            extractedId = match[1].trim();
+        }
+
+        return { text, extractedId };
+    } catch (error) {
+        console.error("OCR Error:", error);
+        throw error;
+    }
+}
+
+module.exports = { extractCertificateId };
+
+
+
+======================================================================
+
+FILE: backend\mockIpfs.js
+
+EXPLANATION: Generates a true SHA-256 hash using crypto.createHash and mocks IPFS CID generation.
+
+======================================================================
+
+
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
+
+const IPFS_DIR = path.join(__dirname, 'ipfs-data');
+
+if (!fs.existsSync(IPFS_DIR)) {
+  fs.mkdirSync(IPFS_DIR, { recursive: true });
+}
+
+/**
+ * Mocks pinning a file to IPFS. Returns a pseudo-CID based on the SHA-256 hash.
+ */
+function pinFileToIPFS(buffer) {
+  return new Promise((resolve) => {
+    // Generate a pseudo-CID using sha256. In real IPFS, it uses multihash (e.g. Qm...)
+    const hash = crypto.createHash('sha256').update(buffer).digest('hex');
+    const cid = `QmMockIPFS${hash.substring(0, 36)}`; 
+    
+    // Save to local directory to mock decentralized storage
+    const filePath = path.join(IPFS_DIR, cid);
+    fs.writeFileSync(filePath, buffer);
+    
+    // Note: We also need the raw file hash for the smart contract mapping 
+    // (since it maps SHA-256 fileHash -> Certificate details)
+    resolve({ cid, fileHash: hash });
+  });
+}
+
+function getFileHash(buffer) {
+  return crypto.createHash('sha256').update(buffer).digest('hex');
+}
+
+module.exports = { pinFileToIPFS, getFileHash };
+
+
+
+======================================================================
+
+FILE: frontend\src\index.css
+
+EXPLANATION: Global CSS file. Includes all custom dark mode glassmorphism UI variables, animations, fonts, and base styling for the App.
+
+======================================================================
+
+
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap');
+
+/* ══════════════════════════════════════════════════════════════════════════════
+   CERTIFYCHAIN — FUTURISTIC DARK THEME
+   ══════════════════════════════════════════════════════════════════════════════ */
+
+:root {
+  --bg-deep:    #020818;
+  --bg-main:    #060d1f;
+  --bg-surface: #0a1628;
+  --bg-card:    rgba(10, 20, 45, 0.75);
+  --bg-elevated:rgba(12, 24, 50, 0.92);
+
+  --primary:       #00f0ff;
+  --primary-dim:   rgba(0, 240, 255, 0.15);
+  --primary-glow:  rgba(0, 240, 255, 0.35);
+  --secondary:     #b44fff;
+  --secondary-dim: rgba(180, 79, 255, 0.15);
+  --secondary-glow:rgba(180, 79, 255, 0.35);
+  --accent:        #00ff88;
+  --accent-dim:    rgba(0, 255, 136, 0.12);
+  --accent-glow:   rgba(0, 255, 136, 0.30);
+  --hot:           #ff3cac;
+
+  --success:       #00ff88;
+  --success-glow:  rgba(0, 255, 136, 0.30);
+  --error:         #ff3c3c;
+  --error-glow:    rgba(255, 60, 60, 0.25);
+  --warning:       #ffc93c;
+
+  --text-main:      #e8f4ff;
+  --text-secondary: #a8c4e0;
+  --text-muted:     #5a7a99;
+  --text-ghost:     #2d4a66;
+  --text-neon:      #00f0ff;
+
+  --border:        rgba(0, 240, 255, 0.10);
+  --border-light:  rgba(0, 240, 255, 0.18);
+  --border-active: rgba(0, 240, 255, 0.50);
+  --border-glow:   rgba(180, 79, 255, 0.35);
+
+  --gradient-primary: linear-gradient(135deg, #00f0ff, #b44fff);
+  --gradient-hero:    linear-gradient(135deg, #00f0ff 0%, #7c3aed 50%, #b44fff 100%);
+  --gradient-accent:  linear-gradient(135deg, #00ff88, #00f0ff);
+  --gradient-hot:     linear-gradient(135deg, #ff3cac, #b44fff);
+  --gradient-card:    linear-gradient(135deg, rgba(0,240,255,0.04), rgba(180,79,255,0.03));
+
+  --radius-sm:   6px;
+  --radius-md:   12px;
+  --radius-lg:   18px;
+  --radius-xl:   24px;
+  --radius-full: 50px;
+
+  --shadow-sm:   0 2px 12px rgba(0,240,255,0.10);
+  --shadow-md:   0 8px 32px rgba(0,240,255,0.15);
+  --shadow-lg:   0 20px 60px rgba(0,240,255,0.18);
+  --shadow-neon: 0 0 20px rgba(0,240,255,0.4), 0 0 60px rgba(0,240,255,0.15);
+  --shadow-purple: 0 0 20px rgba(180,79,255,0.4), 0 0 60px rgba(180,79,255,0.15);
+}
+
+/* ── Reset ─────────────────────────────────────────────────────────────── */
+*, *::before, *::after { margin:0; padding:0; box-sizing:border-box; }
+html { scroll-behavior: smooth; }
+
+body {
+  font-family: 'Space Grotesk', 'Inter', sans-serif;
+  background: var(--bg-deep);
+  color: var(--text-main);
+  min-height: 100vh;
+  overflow-x: hidden;
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Scanline overlay */
+body::after {
+  content: '';
+  position: fixed; inset: 0;
+  background: repeating-linear-gradient(
+    0deg,
+    transparent,
+    transparent 2px,
+    rgba(0,0,0,0.03) 2px,
+    rgba(0,0,0,0.03) 4px
+  );
+  pointer-events: none;
+  z-index: 9998;
+}
+
+/* ── Typography ─────────────────────────────────────────────────────────── */
+h1 { font-size: 2.75rem; font-weight: 800; letter-spacing: -0.03em; line-height: 1.15; }
+h2 { font-size: 1.75rem; font-weight: 700; letter-spacing: -0.02em; }
+h3 { font-size: 1.2rem; font-weight: 600; }
+p  { color: var(--text-secondary); line-height: 1.7; }
+
+.gradient-text {
+  background: var(--gradient-hero);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+  background-size: 200% 200%;
+  animation: gradientShift 4s ease infinite;
+}
+
+@keyframes gradientShift {
+  0%   { background-position: 0% 50%; }
+  50%  { background-position: 100% 50%; }
+  100% { background-position: 0% 50%; }
+}
+
+.neon-text {
+  color: var(--primary);
+  text-shadow: 0 0 10px var(--primary-glow), 0 0 30px rgba(0,240,255,0.2);
+}
+
+/* ── Layout ─────────────────────────────────────────────────────────────── */
+.app-wrapper { display: flex; flex-direction: column; min-height: 100vh; }
+.app-container { max-width: 1200px; margin: 0 auto; padding: 0 2rem; width: 100%; flex: 1; }
+
+/* ── Navigation ─────────────────────────────────────────────────────────── */
+.navbar {
+  position: sticky; top: 0; z-index: 100;
+  padding: 0.85rem 2rem;
+  background: rgba(2, 8, 24, 0.85);
+  backdrop-filter: blur(24px);
+  -webkit-backdrop-filter: blur(24px);
+  border-bottom: 1px solid rgba(0,240,255,0.12);
+  box-shadow: 0 0 40px rgba(0,240,255,0.05);
+}
+
+.navbar-inner {
+  max-width: 1200px; margin: 0 auto;
+  display: flex; justify-content: space-between; align-items: center;
+}
+
+.navbar-brand { text-decoration: none; display: flex; align-items: center; gap: 0.75rem; }
+
+.navbar-brand .brand-icon {
+  width: 38px; height: 38px; border-radius: var(--radius-sm);
+  background: var(--gradient-primary);
+  display: flex; align-items: center; justify-content: center;
+  font-size: 1.1rem; box-shadow: var(--shadow-neon);
+  animation: iconPulse 3s ease-in-out infinite;
+}
+
+@keyframes iconPulse {
+  0%,100% { box-shadow: 0 0 15px rgba(0,240,255,0.4); }
+  50%      { box-shadow: 0 0 30px rgba(0,240,255,0.7), 0 0 60px rgba(0,240,255,0.2); }
+}
+
+.navbar-brand .brand-text {
+  font-size: 1.45rem; font-weight: 800;
+  background: var(--gradient-primary);
+  -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text;
+  letter-spacing: -0.02em;
+}
+
+.nav-links { display: flex; gap: 0.4rem; align-items: center; }
+
+.nav-link {
+  color: var(--text-muted); text-decoration: none;
+  font-weight: 500; font-size: 0.88rem;
+  padding: 0.45rem 0.95rem; border-radius: var(--radius-full);
+  transition: all 0.25s ease; letter-spacing: 0.01em;
+  border: 1px solid transparent;
+}
+.nav-link:hover {
+  color: var(--primary); border-color: rgba(0,240,255,0.2);
+  background: rgba(0,240,255,0.06);
+  text-shadow: 0 0 10px var(--primary-glow);
+}
+.nav-link.active {
+  color: var(--primary); border-color: rgba(0,240,255,0.3);
+  background: rgba(0,240,255,0.08);
+  box-shadow: inset 0 0 10px rgba(0,240,255,0.08), 0 0 15px rgba(0,240,255,0.1);
+}
+
+/* ── Glass Panel ─────────────────────────────────────────────────────────── */
+.glass-panel {
+  background: var(--bg-card);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: 2rem;
+  box-shadow: 0 4px 24px rgba(0,0,0,0.3), inset 0 1px 0 rgba(0,240,255,0.06);
+  transition: all 0.4s cubic-bezier(0.4,0,0.2,1);
+  position: relative;
+  overflow: hidden;
+}
+
+/* HUD corner brackets */
+.glass-panel::before, .glass-panel::after {
+  content: '';
+  position: absolute;
+  width: 16px; height: 16px;
+  border-color: var(--primary);
+  border-style: solid;
+  opacity: 0.4;
+  transition: opacity 0.3s, width 0.3s, height 0.3s;
+}
+.glass-panel::before { top: 10px; left: 10px; border-width: 2px 0 0 2px; border-radius: 3px 0 0 0; }
+.glass-panel::after  { bottom: 10px; right: 10px; border-width: 0 2px 2px 0; border-radius: 0 0 3px 0; }
+
+.glass-panel:hover {
+  border-color: rgba(0,240,255,0.28);
+  box-shadow: 0 8px 40px rgba(0,0,0,0.4), 0 0 30px rgba(0,240,255,0.08), inset 0 1px 0 rgba(0,240,255,0.1);
+  transform: translateY(-2px);
+}
+.glass-panel:hover::before, .glass-panel:hover::after { opacity: 1; width: 20px; height: 20px; }
+
+/* ── Buttons ─────────────────────────────────────────────────────────────── */
+.btn {
+  display: inline-flex; align-items: center; justify-content: center; gap: 0.5rem;
+  padding: 0.8rem 1.75rem; border-radius: var(--radius-md);
+  font-weight: 600; font-size: 0.95rem; cursor: pointer;
+  transition: all 0.25s ease; border: none; text-decoration: none; font-family: inherit;
+  position: relative; overflow: hidden; letter-spacing: 0.02em;
+}
+
+.btn-primary {
+  background: transparent;
+  color: var(--primary);
+  border: 1.5px solid var(--primary);
+  box-shadow: 0 0 12px rgba(0,240,255,0.2), inset 0 0 12px rgba(0,240,255,0.05);
+}
+.btn-primary::before {
+  content: '';
+  position: absolute; inset: 0;
+  background: linear-gradient(135deg, rgba(0,240,255,0.12), rgba(180,79,255,0.08));
+  opacity: 0; transition: opacity 0.3s;
+}
+.btn-primary:hover {
+  color: var(--bg-deep);
+  background: var(--primary);
+  box-shadow: 0 0 25px rgba(0,240,255,0.5), 0 0 50px rgba(0,240,255,0.2);
+  text-shadow: none;
+}
+.btn-primary:hover::before { opacity: 1; }
+.btn-primary:active { transform: scale(0.98); }
+.btn-primary:disabled { opacity: 0.35; cursor: not-allowed; transform: none; }
+
+.btn-secondary {
+  background: transparent;
+  color: var(--secondary);
+  border: 1.5px solid var(--secondary);
+  box-shadow: 0 0 12px rgba(180,79,255,0.2);
+}
+.btn-secondary:hover {
+  color: #fff; background: var(--secondary);
+  box-shadow: 0 0 25px rgba(180,79,255,0.5), 0 0 50px rgba(180,79,255,0.2);
+}
+
+.btn-outline {
+  background: transparent; color: var(--text-secondary);
+  border: 1.5px solid rgba(0,240,255,0.25); border-radius: var(--radius-md);
+}
+.btn-outline:hover {
+  background: rgba(0,240,255,0.06);
+  border-color: var(--primary); color: var(--primary);
+}
+
+.btn-accent {
+  background: transparent; color: var(--accent);
+  border: 1.5px solid var(--accent);
+  box-shadow: 0 0 12px rgba(0,255,136,0.2);
+}
+.btn-accent:hover {
+  color: var(--bg-deep); background: var(--accent);
+  box-shadow: 0 0 25px rgba(0,255,136,0.5);
+}
+
+.btn-sm  { padding: 0.45rem 1rem; font-size: 0.82rem; border-radius: var(--radius-sm); }
+.btn-lg  { padding: 1rem 2.25rem; font-size: 1.05rem; border-radius: var(--radius-lg); }
+
+/* ── Forms ─────────────────────────────────────────────────────────────── */
+.form-group { margin-bottom: 1.5rem; }
+
+.form-label {
+  display: block; margin-bottom: 0.5rem;
+  font-size: 0.82rem; font-weight: 600;
+  color: var(--text-muted); letter-spacing: 0.06em; text-transform: uppercase;
+}
+
+.form-input {
+  width: 100%; padding: 0.8rem 1rem;
+  border-radius: var(--radius-md);
+  background: rgba(0,240,255,0.03);
+  border: 1.5px solid rgba(0,240,255,0.12);
+  color: var(--text-main); font-size: 0.95rem; font-family: inherit;
+  transition: all 0.25s ease;
+}
+.form-input:focus {
+  outline: none;
+  border-color: var(--primary);
+  background: rgba(0,240,255,0.06);
+  box-shadow: 0 0 0 3px rgba(0,240,255,0.10), 0 0 20px rgba(0,240,255,0.1);
+}
+.form-input::placeholder { color: var(--text-ghost); }
+
+/* ── Dropzone ─────────────────────────────────────────────────────────── */
+.dropzone {
+  border: 2px dashed rgba(0,240,255,0.25);
+  border-radius: var(--radius-lg);
+  padding: 3rem 2rem; text-align: center; cursor: pointer;
+  background: rgba(0,240,255,0.02);
+  transition: all 0.35s cubic-bezier(0.34,1.56,0.64,1);
+  position: relative; user-select: none;
+}
+.dropzone:hover {
+  border-color: var(--primary);
+  background: rgba(0,240,255,0.05);
+  transform: scale(1.01);
+  box-shadow: 0 0 30px rgba(0,240,255,0.1);
+}
+.dropzone.drag-over {
+  border-color: var(--primary); border-style: solid;
+  background: rgba(0,240,255,0.08);
+  transform: scale(1.02);
+  box-shadow: 0 0 0 4px rgba(0,240,255,0.15), 0 0 60px rgba(0,240,255,0.15);
+  animation: dropzonePulse 0.8s ease-in-out infinite alternate;
+}
+@keyframes dropzonePulse {
+  0%   { box-shadow: 0 0 0 4px rgba(0,240,255,0.15), 0 0 40px rgba(0,240,255,0.12); }
+  100% { box-shadow: 0 0 0 8px rgba(0,240,255,0.10), 0 0 80px rgba(0,240,255,0.20); }
+}
+.dropzone.has-file { border-color: var(--accent); border-style: solid; background: rgba(0,255,136,0.04); }
+
+.drop-icon { font-size: 3rem; margin-bottom: 1rem; display: block; animation: floatIcon 3s ease-in-out infinite; }
+@keyframes floatIcon { 0%,100%{transform:translateY(0)} 50%{transform:translateY(-10px)} }
+
+.dropzone-hint {
+  display: inline-flex; align-items: center; gap: 0.75rem; margin-top: 0.75rem;
+  padding: 0.4rem 1rem; background: rgba(0,240,255,0.06);
+  border-radius: var(--radius-full); font-size: 0.8rem; color: var(--text-muted); border: 1px solid rgba(0,240,255,0.12);
+}
+.file-type-badge {
+  display: inline-block; margin-top: 0.5rem; padding: 0.2rem 0.65rem;
+  background: var(--gradient-primary); color: var(--bg-deep);
+  border-radius: var(--radius-sm); font-size: 0.68rem; font-weight: 800; letter-spacing: 0.08em;
+}
+
+/* ── Tabs ─────────────────────────────────────────────────────────────── */
+.tab-bar {
+  display: flex; gap: 0.25rem; padding: 0.35rem;
+  background: rgba(0,240,255,0.04); border-radius: var(--radius-md);
+  margin-bottom: 1.5rem; border: 1px solid rgba(0,240,255,0.08);
+}
+.tab-btn {
+  flex: 1; padding: 0.65rem 1.2rem;
+  background: transparent; border: none; border-radius: var(--radius-sm);
+  color: var(--text-muted); font-size: 0.9rem; font-weight: 500;
+  cursor: pointer; transition: all 0.25s ease; font-family: inherit;
+}
+.tab-btn.active {
+  background: rgba(0,240,255,0.10); color: var(--primary);
+  box-shadow: 0 0 15px rgba(0,240,255,0.15); font-weight: 600;
+  border: 1px solid rgba(0,240,255,0.2);
+}
+.tab-btn:hover:not(.active) { color: var(--text-main); background: rgba(0,240,255,0.04); }
+
+/* ── Data Table ─────────────────────────────────────────────────────────── */
+.data-table { display: flex; flex-direction: column; gap: 0; }
+.data-row {
+  display: flex; justify-content: space-between; align-items: flex-start;
+  padding: 0.7rem 0; border-bottom: 1px solid rgba(0,240,255,0.07);
+  gap: 1rem; font-size: 0.88rem;
+}
+.data-row:last-child { border-bottom: none; }
+.data-row > span:first-child { color: var(--text-muted); font-weight: 500; white-space: nowrap; flex-shrink: 0; }
+.data-row > *:last-child { text-align: right; }
+
+code.hash {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.72rem; color: var(--primary);
+  word-break: break-all; letter-spacing: 0.02em;
+}
+
+/* ── Result Banners ─────────────────────────────────────────────────────── */
+.result-banner {
+  border-radius: var(--radius-lg); padding: 1.5rem;
+  animation: bannerIn 0.5s cubic-bezier(0.34,1.56,0.64,1);
+}
+@keyframes bannerIn { from{transform:scale(0.95);opacity:0} to{transform:scale(1);opacity:1} }
+
+.result-valid {
+  background: rgba(0,255,136,0.06); border: 1.5px solid rgba(0,255,136,0.3);
+  box-shadow: 0 0 30px rgba(0,255,136,0.1);
+}
+.result-fake {
+  background: rgba(255,60,60,0.06); border: 1.5px solid rgba(255,60,60,0.3);
+  box-shadow: 0 0 30px rgba(255,60,60,0.1);
+}
+
+/* ── Algorithm Stepper ─────────────────────────────────────────────────── */
+.algo-stepper {
+  display: flex; align-items: center; gap: 0;
+  padding: 1.25rem 1.5rem;
+  background: rgba(0,240,255,0.04); border: 1px solid rgba(0,240,255,0.10);
+  border-radius: var(--radius-lg); margin-bottom: 2rem;
+  overflow-x: auto; scrollbar-width: none;
+  box-shadow: inset 0 0 20px rgba(0,240,255,0.03);
+}
+.algo-stepper::-webkit-scrollbar { display: none; }
+.algo-step { display: flex; align-items: center; gap: 0.5rem; white-space: nowrap; flex-shrink: 0; }
+
+.step-number {
+  width: 28px; height: 28px; border-radius: 50%;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 0.7rem; font-weight: 700; border: 2px solid rgba(0,240,255,0.2);
+  color: var(--text-ghost); background: transparent; flex-shrink: 0;
+  transition: all 0.5s cubic-bezier(0.34,1.56,0.64,1);
+}
+.step-label { font-size: 0.77rem; font-weight: 500; color: var(--text-ghost); transition: color 0.4s ease; }
+.step-connector {
+  width: 30px; height: 2px; background: rgba(0,240,255,0.10);
+  margin: 0 0.25rem; flex-shrink: 0; border-radius: 1px; overflow: hidden; position: relative;
+}
+.step-connector::after {
+  content:''; position:absolute; left:0; top:0; width:0%; height:100%;
+  background: var(--gradient-accent); border-radius:1px; transition:width .6s ease;
+}
+.algo-step.completed .step-number {
+  background: var(--accent); border-color: var(--accent); color: var(--bg-deep);
+  box-shadow: 0 0 12px var(--accent-glow); animation: stepPop 0.4s cubic-bezier(0.34,1.56,0.64,1);
+}
+.algo-step.completed .step-label { color: var(--accent); }
+.algo-step.active .step-number {
+  border-color: var(--primary); color: var(--primary);
+  background: rgba(0,240,255,0.08); animation: stepPulse 2s ease-in-out infinite;
+}
+.algo-step.active .step-label { color: var(--primary); font-weight: 600; }
+.step-connector.completed::after { width: 100%; }
+
+@keyframes stepPop { 0%{transform:scale(1)} 50%{transform:scale(1.3)} 100%{transform:scale(1)} }
+@keyframes stepPulse {
+  0%,100% { box-shadow: 0 0 8px rgba(0,240,255,0.3); }
+  50%      { box-shadow: 0 0 20px rgba(0,240,255,0.7), 0 0 40px rgba(0,240,255,0.2); }
+}
+
+/* ── Processing Log ─────────────────────────────────────────────────────── */
+.processing-log {
+  background: rgba(0,0,0,0.3); border: 1px solid rgba(0,240,255,0.08);
+  border-radius: var(--radius-md); padding: 1rem; font-family: 'JetBrains Mono', monospace;
+  font-size: 0.78rem;
+}
+.log-entry { padding: 0.25rem 0; }
+.log-entry.success { color: var(--accent); }
+.log-entry.error   { color: var(--error); }
+.log-entry.info    { color: var(--primary); }
+
+/* ── QR section ─────────────────────────────────────────────────────────── */
+.qr-section {
+  text-align: center; padding: 1.5rem;
+  background: rgba(0,240,255,0.03); border: 1px solid rgba(0,240,255,0.1);
+  border-radius: var(--radius-md);
+}
+.qr-section img { border-radius: var(--radius-sm); box-shadow: 0 0 20px rgba(0,240,255,0.2); }
+
+/* ── Page animations ─────────────────────────────────────────────────────── */
+.page-enter { animation: pageEnter 0.5s ease; }
+@keyframes pageEnter { from{opacity:0;transform:translateY(16px)} to{opacity:1;transform:translateY(0)} }
+
+/* ── Loader spinner ─────────────────────────────────────────────────────── */
+.loader {
+  width: 18px; height: 18px; border: 2px solid transparent;
+  border-top-color: var(--primary); border-right-color: var(--primary);
+  border-radius: 50%; animation: spin 0.7s linear infinite; flex-shrink: 0;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* ── Footer ─────────────────────────────────────────────────────────────── */
+.app-footer {
+  margin-top: auto; padding: 1.25rem 2rem;
+  border-top: 1px solid rgba(0,240,255,0.08);
+  background: rgba(2,8,24,0.9);
+}
+.footer-inner {
+  max-width: 1200px; margin: 0 auto;
+  display: flex; justify-content: space-between; align-items: center;
+  font-size: 0.82rem; color: var(--text-ghost);
+}
+.footer-tech { display: flex; gap: 1.5rem; }
+.footer-tech span { color: var(--text-muted); transition: color 0.2s; }
+.footer-tech span:hover { color: var(--primary); }
+
+/* ── Hero section specifics ─────────────────────────────────────────────── */
+.hero h1 { font-size: 3.8rem; }
+
+/* ── Flow diagram ─────────────────────────────────────────────────────────── */
+.flow-diagram {
+  display: flex; flex-wrap: wrap; gap: 0.75rem; justify-content: center;
+  align-items: center;
+}
+.flow-node {
+  display: flex; flex-direction: column; align-items: center; gap: 0.35rem;
+  padding: 0.75rem 1.1rem; border-radius: var(--radius-md);
+  background: rgba(0,240,255,0.04); border: 1px solid rgba(0,240,255,0.12);
+  transition: all 0.25s ease; cursor: default;
+}
+.flow-node:hover {
+  background: rgba(0,240,255,0.08); border-color: var(--primary);
+  box-shadow: 0 0 20px rgba(0,240,255,0.12); transform: translateY(-2px);
+}
+.node-icon { font-size: 1.5rem; }
+
+/* ── Wallet container ─────────────────────────────────────────────────────── */
+.wallet-container { margin-left: 0.5rem; }
+
+/* ── Admin page ─────────────────────────────────────────────────────────── */
+.admin-page { padding: 2.5rem 0; }
+.verify-page { padding: 2.5rem 0; }
+.landing-page { padding-top: 1rem; }
+
+/* ── Hexagon grid bg accent ─────────────────────────────────────────────── */
+.hex-grid-bg {
+  position: absolute; inset: 0; pointer-events: none; opacity: 0.03;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='56' height='100'%3E%3Cpath d='M28 66L0 50V16L28 0l28 16v34L28 66zm0-2l26-15V18L28 2 2 18v31l26 15z' fill='%2300f0ff'/%3E%3C/svg%3E");
+  background-size: 56px 100px;
+}
+
+/* ── Result badge ─────────────────────────────────────────────────────── */
+.result-badge {
+  display: inline-flex; align-items: center; gap: 0.4rem;
+  padding: 0.35rem 0.9rem; border-radius: var(--radius-full);
+  font-size: 0.75rem; font-weight: 800; letter-spacing: 0.05em;
+}
+
+/* ── Page header ─────────────────────────────────────────────────────── */
+.page-header { margin-bottom: 2rem; }
+
+
+
+======================================================================
+
+FILE: frontend\src\App.jsx
+
+EXPLANATION: React app router and main layout. Includes the Navbar, custom MetaMask connection modal, and navigation links to portals.
+
+======================================================================
+
+
+import React, { useState, useCallback, useEffect, createContext } from 'react';
+import { BrowserRouter as Router, Routes, Route, Link, useLocation } from 'react-router-dom';
+import { ethers } from 'ethers';
+
+import LandingPage from './components/LandingPage';
+import AdminDashboard from './components/AdminDashboard';
+import VerificationPortal from './components/VerificationPortal';
+import RainbowBackground from './components/RainbowBackground';
+
+export const WalletContext = createContext({ address: null });
+
+/* ── Wallet options ──────────────────────────────────────────────────────── */
+const WALLETS = [
+    {
+        id: 'metamask',
+        name: 'MetaMask',
+        desc: 'Browser extension wallet',
+        icon: 'https://upload.wikimedia.org/wikipedia/commons/3/36/MetaMask_Fox.svg',
+        emoji: '🦊',
+        iconBg: '#f5f0e8',
+        detect: () => typeof window !== 'undefined' && !!window.ethereum,
+        connect: async () => {
+            const provider = new ethers.BrowserProvider(window.ethereum);
+            const accounts = await provider.send('eth_requestAccounts', []);
+            return accounts[0];
+        },
+        installUrl: 'https://metamask.io/download/',
+    },
+    {
+        id: 'walletconnect',
+        name: 'Other Wallets',
+        desc: 'WalletConnect, Ledger, etc.',
+        emoji: '🔗',
+        iconBg: 'linear-gradient(135deg,#3b82f6,#8b5cf6)',
+        detect: () => true, // Built-in fallback
+        connect: async () => {
+             // In a real app involving WalletConnect, we'd trigger the WalletConnect modal here.
+            alert("WalletConnect option selected (Place holder for other wallets setup)");
+            throw new Error("WalletConnect pending");
+        },
+        installUrl: '#',
+    }
+];
+
+/* ── Wallet Modal ────────────────────────────────────────────────────────── */
+function WalletModal({ onClose, onConnected }) {
+    const [status, setStatus] = useState({});
+
+    const tryConnect = useCallback(async (wallet) => {
+        const available = wallet.detect();
+        if (!available) { window.open(wallet.installUrl, '_blank'); return; }
+        setStatus(s => ({ ...s, [wallet.id]: 'connecting' }));
+        try {
+            const addr = await wallet.connect();
+            onConnected(addr);
+            onClose();
+        } catch (err) {
+            console.error(err.message);
+            setStatus(s => ({ ...s, [wallet.id]: 'error' }));
+            setTimeout(() => setStatus(s => ({ ...s, [wallet.id]: undefined })), 2000);
+        }
+    }, [onConnected, onClose]);
+
+    return (
+        <div onClick={onClose} style={{
+            position: 'fixed', inset: 0, zIndex: 9000,
+            background: 'rgba(0,0,0,0.45)', backdropFilter: 'blur(8px)',
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+            padding: '1rem', // prevents modal from hitting screen edges on tiny screens
+            animation: 'fadeIn .2s ease',
+        }}>
+            <div onClick={e => e.stopPropagation()} style={{
+                background: 'rgba(255,255,255,0.98)',
+                borderRadius: 24, padding: '2rem',
+                width: 400, maxWidth: '100%',
+                maxHeight: '90vh', overflowY: 'auto', // Fix: ensures modal never overflows top/bottom of screen
+                boxShadow: '0 40px 100px rgba(99,102,241,0.22)',
+                animation: 'slideUp .28s cubic-bezier(.34,1.56,.64,1)',
+                position: 'relative',
+            }}>
+
+                {/* Close */}
+                <button onClick={onClose} style={{
+                    position: 'absolute', top: 16, right: 16,
+                    background: 'rgba(0,0,0,0.06)', border: 'none',
+                    borderRadius: '50%', width: 32, height: 32,
+                    cursor: 'pointer', fontSize: '1rem', color: '#888',
+                    display: 'flex', alignItems: 'center', justifyContent: 'center',
+                    transition: 'all .2s',
+                }} onMouseEnter={e => e.currentTarget.style.background = 'rgba(0,0,0,0.12)'}
+                   onMouseLeave={e => e.currentTarget.style.background = 'rgba(0,0,0,0.06)'}>✕</button>
+
+                {/* Header */}
+                <div style={{ textAlign: 'center', marginBottom: '1.5rem' }}>
+                    <div style={{
+                        width: 56, height: 56, borderRadius: 16, margin: '0 auto 1rem',
+                        background: 'linear-gradient(135deg,#6366f1,#a855f7)',
+                        display: 'flex', alignItems: 'center', justifyContent: 'center',
+                        fontSize: '1.75rem', boxShadow: '0 8px 24px rgba(99,102,241,0.35)',
+                    }}>⛓</div>
+                    <h2 style={{ margin: 0, fontWeight: 800, fontSize: '1.3rem', color: '#111' }}>Connect Wallet</h2>
+                    <p style={{ margin: '0.35rem 0 0', fontSize: '0.85rem', color: '#888' }}>
+                        Select a wallet to connect to CertifyChain
+                    </p>
+                </div>
+
+                {/* Wallet list */}
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '0.65rem' }}>
+                    {WALLETS.map(w => {
+                        const isAvailable = w.detect();
+                        const s = status[w.id];
+                        return (
+                            <button key={w.id} onClick={() => tryConnect(w)} style={{
+                                display: 'flex', alignItems: 'center', gap: '1rem',
+                                padding: '0.9rem 1.1rem', borderRadius: 14, width: '100%',
+                                background: s === 'connecting' ? '#f5f5ff' : '#fafafa',
+                                border: s === 'error' ? '2px solid #ef4444' : '2px solid #ebebeb',
+                                cursor: 'pointer', textAlign: 'left',
+                                transition: 'all .18s ease',
+                            }}
+                                onMouseEnter={e => {
+                                    e.currentTarget.style.borderColor = '#6366f1';
+                                    e.currentTarget.style.background = '#f5f5ff';
+                                    e.currentTarget.style.transform = 'translateY(-1px)';
+                                }}
+                                onMouseLeave={e => {
+                                    e.currentTarget.style.borderColor = s === 'error' ? '#ef4444' : '#ebebeb';
+                                    e.currentTarget.style.background = s === 'connecting' ? '#f5f5ff' : '#fafafa';
+                                    e.currentTarget.style.transform = 'translateY(0)';
+                                }}
+                            >
+                                {/* Icon */}
+                                <div style={{
+                                    width: 44, height: 44, borderRadius: 10, flexShrink: 0,
+                                    background: w.iconBg || '#f1f1f1',
+                                    display: 'flex', alignItems: 'center', justifyContent: 'center',
+                                    fontSize: '1.5rem', overflow: 'hidden',
+                                }}>
+                                    {w.icon
+                                        ? <img src={w.icon} alt={w.name} width={34} height={34} style={{ borderRadius: 6 }}
+                                            onError={e => { e.target.style.display = 'none'; e.target.parentNode.textContent = w.emoji; }} />
+                                        : w.emoji}
+                                </div>
+
+                                {/* Labels */}
+                                <div style={{ flex: 1 }}>
+                                    <div style={{ fontWeight: 700, fontSize: '0.97rem', color: '#111' }}>{w.name}</div>
+                                    <div style={{ fontSize: '0.78rem', color: s === 'error' ? '#ef4444' : s === 'connecting' ? '#6366f1' : '#888' }}>
+                                        {s === 'connecting' ? '⏳ Connecting…'
+                                           : s === 'error'      ? '❌ Failed — try again'
+                                           : isAvailable        ? w.desc
+                                           : 'Not installed — click to install'}
+                                    </div>
+                                </div>
+
+                                {/* Badge */}
+                                {isAvailable && !s && (
+                                    <span style={{
+                                        fontSize: '0.68rem', fontWeight: 700, padding: '0.2rem 0.55rem',
+                                        borderRadius: 20, background: 'rgba(5,150,105,0.1)',
+                                        color: '#059669', flexShrink: 0,
+                                    }}>Detected</span>
+                                )}
+                                {!isAvailable && !s && (
+                                    <span style={{ color: '#ccc', fontSize: '1.1rem', flexShrink: 0 }}>↗</span>
+                                )}
+                            </button>
+                        );
+                    })}
+                </div>
+
+                <p style={{ textAlign: 'center', fontSize: '0.73rem', color: '#bbb', marginTop: '1.25rem', marginBottom: 0 }}>
+                    By connecting, you agree to CertifyChain's Terms of Service
+                </p>
+
+                <style>{`
+                    @keyframes fadeIn { from{opacity:0} to{opacity:1} }
+                    @keyframes slideUp { from{transform:translateY(36px) scale(.97);opacity:0} to{transform:translateY(0) scale(1);opacity:1} }
+                `}</style>
+            </div>
+        </div>
+    );
+}
+
+/* ── Wallet Button ───────────────────────────────────────────────────────── */
+function WalletButton({ onAddressChange }) {
+    const [address, setAddress] = useState(null);
+    const [showModal, setShowModal] = useState(false);
+
+    useEffect(() => {
+        if (window.ethereum) {
+            window.ethereum.request({ method: 'eth_accounts' })
+                .then(accs => { if (accs[0]) { setAddress(accs[0]); onAddressChange?.(accs[0]); } })
+                .catch(() => {});
+        }
+    }, []);
+
+    const handleConnected = useCallback((addr) => {
+        setAddress(addr); onAddressChange?.(addr);
+    }, [onAddressChange]);
+
+    const disconnect = useCallback(() => { setAddress(null); onAddressChange?.(null); }, [onAddressChange]);
+
+    if (address) {
+        return (
+            <button className="btn btn-outline btn-sm" onClick={disconnect} title="Disconnect"
+                style={{ fontFamily: 'monospace', display: 'flex', alignItems: 'center', gap: '0.45rem' }}>
+                <span style={{ width: 8, height: 8, borderRadius: '50%', background: '#22c55e', boxShadow: '0 0 6px #22c55e', display: 'inline-block' }} />
+                {address.slice(0, 6)}…{address.slice(-4)}
+            </button>
+        );
+    }
+
+    return (
+        <>
+            <button className="btn btn-primary btn-sm" onClick={() => setShowModal(true)}>
+                🔗 Connect Wallet
+            </button>
+            {showModal && <WalletModal onClose={() => setShowModal(false)} onConnected={handleConnected} />}
+        </>
+    );
+}
+
+/* ── Nav ─────────────────────────────────────────────────────────────────── */
+function NavLink({ to, children }) {
+    const location = useLocation();
+    const isActive = location.pathname === to;
+    return <Link to={to} className={`nav-link ${isActive ? 'active' : ''}`}>{children}</Link>;
+}
+
+/* ── App ─────────────────────────────────────────────────────────────────── */
+function AppContent() {
+    const [walletAddress, setWalletAddress] = useState(null);
+
+    return (
+        <div className="app-wrapper">
+            <RainbowBackground />
+
+            <nav className="navbar">
+                <div className="navbar-inner">
+                    <Link to="/" className="navbar-brand">
+                        <div className="brand-icon">⛓</div>
+                        <span className="brand-text">CertifyChain</span>
+                    </Link>
+                    <div className="nav-links">
+                        <NavLink to="/">Home</NavLink>
+                        <NavLink to="/verify">Verify</NavLink>
+                        <NavLink to="/admin">Admin</NavLink>
+                        <div className="wallet-container">
+                            <WalletButton onAddressChange={setWalletAddress} />
+                        </div>
+                    </div>
+                </div>
+            </nav>
+
+            <main className="app-container" style={{ position: 'relative', zIndex: 1 }}>
+                <Routes>
+                    <Route path="/" element={<LandingPage />} />
+                    <Route path="/verify" element={<VerificationPortal />} />
+                    <Route path="/admin" element={<AdminDashboard walletAddress={walletAddress} />} />
+                </Routes>
+            </main>
+
+            <footer className="app-footer" style={{ position: 'relative', zIndex: 1 }}>
+                <div className="footer-inner">
+                    <span>© 2024 CertifyChain — Blockchain Certificate Verification</span>
+                    <div className="footer-tech">
+                        <span>⚡ Ethereum</span>
+                        <span>🔐 SHA-256</span>
+                        <span>📦 IPFS</span>
+                        <span>🔍 Tesseract OCR</span>
+                    </div>
+                </div>
+            </footer>
+        </div>
+    );
+}
+
+function App() {
+    return <Router><AppContent /></Router>;
+}
+
+export default App;
+
+
+
+======================================================================
+
+FILE: frontend\src\components\RainbowBackground.jsx
+
+EXPLANATION: A subtle animated background component creating the floating rainbow particles behind the glass panels.
+
+======================================================================
+
+
+import React, { useEffect, useRef } from 'react';
+
+/* ── Blockchain Network Canvas ─────────────────────────────────────────── */
+const BlockchainCanvas = () => {
+    const canvasRef = useRef(null);
+    const rafRef = useRef(null);
+
+    useEffect(() => {
+        const canvas = canvasRef.current;
+        if (!canvas) return;
+        const ctx = canvas.getContext('2d');
+
+        const resize = () => { canvas.width = window.innerWidth; canvas.height = window.innerHeight; };
+        resize();
+        window.addEventListener('resize', resize);
+
+        const NODE_COUNT = 40;
+        const nodes = Array.from({ length: NODE_COUNT }, () => ({
+            x: Math.random() * canvas.width,
+            y: Math.random() * canvas.height,
+            vx: (Math.random() - 0.5) * 0.5,
+            vy: (Math.random() - 0.5) * 0.5,
+            r: 2 + Math.random() * 3,
+            pulse: Math.random() * Math.PI * 2,
+            pulseSpeed: 0.015 + Math.random() * 0.02,
+            color: Math.random() < 0.6 ? '#00f0ff' : (Math.random() < 0.5 ? '#b44fff' : '#00ff88'),
+        }));
+
+        // Data packets on edges
+        const packets = Array.from({ length: 12 }, () => ({
+            fromIdx: Math.floor(Math.random() * NODE_COUNT),
+            toIdx: Math.floor(Math.random() * NODE_COUNT),
+            progress: Math.random(),
+            speed: 0.003 + Math.random() * 0.005,
+            color: Math.random() < 0.5 ? '#00f0ff' : '#b44fff',
+        }));
+
+        // Floating hash labels
+        const LABELS = ['0x4f3a…', 'TX✓', '#sha256', 'BLOCK', '⛓', 'CERT-ID', 'HASH', '0xA1B2…', 'VALID', 'SIGN'];
+        const floaters = Array.from({ length: 14 }, (_, i) => ({
+            text: LABELS[i % LABELS.length],
+            x: Math.random() * canvas.width,
+            y: Math.random() * canvas.height,
+            vy: -(0.15 + Math.random() * 0.25),
+            opacity: 0.08 + Math.random() * 0.18,
+            size: 10 + Math.random() * 5,
+            color: Math.random() < 0.5 ? '#00f0ff' : '#b44fff',
+        }));
+
+        const CONNECT_DIST = 160;
+
+        const animate = () => {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+            // Move nodes
+            for (const n of nodes) {
+                n.x += n.vx; n.y += n.vy; n.pulse += n.pulseSpeed;
+                if (n.x < 0 || n.x > canvas.width) n.vx *= -1;
+                if (n.y < 0 || n.y > canvas.height) n.vy *= -1;
+            }
+
+            // Draw edges
+            for (let i = 0; i < nodes.length; i++) {
+                for (let j = i + 1; j < nodes.length; j++) {
+                    const dx = nodes[i].x - nodes[j].x;
+                    const dy = nodes[i].y - nodes[j].y;
+                    const dist = Math.sqrt(dx * dx + dy * dy);
+                    if (dist < CONNECT_DIST) {
+                        const alpha = (1 - dist / CONNECT_DIST) * 0.35;
+                        const grad = ctx.createLinearGradient(nodes[i].x, nodes[i].y, nodes[j].x, nodes[j].y);
+                        grad.addColorStop(0, `rgba(0,240,255,${alpha})`);
+                        grad.addColorStop(1, `rgba(180,79,255,${alpha})`);
+                        ctx.beginPath();
+                        ctx.moveTo(nodes[i].x, nodes[i].y);
+                        ctx.lineTo(nodes[j].x, nodes[j].y);
+                        ctx.strokeStyle = grad;
+                        ctx.lineWidth = 1;
+                        ctx.stroke();
+                    }
+                }
+            }
+
+            // Draw data packets
+            for (const pkt of packets) {
+                pkt.progress += pkt.speed;
+                if (pkt.progress >= 1) {
+                    pkt.progress = 0;
+                    pkt.fromIdx = pkt.toIdx;
+                    pkt.toIdx = Math.floor(Math.random() * NODE_COUNT);
+                }
+                const from = nodes[pkt.fromIdx];
+                const to = nodes[pkt.toIdx];
+                const px = from.x + (to.x - from.x) * pkt.progress;
+                const py = from.y + (to.y - from.y) * pkt.progress;
+                ctx.beginPath();
+                ctx.arc(px, py, 3, 0, Math.PI * 2);
+                ctx.fillStyle = pkt.color;
+                ctx.shadowColor = pkt.color;
+                ctx.shadowBlur = 12;
+                ctx.fill();
+                ctx.shadowBlur = 0;
+            }
+
+            // Draw nodes
+            for (const n of nodes) {
+                const glow = 0.5 + 0.5 * Math.sin(n.pulse);
+                // Outer ring
+                ctx.beginPath(); ctx.arc(n.x, n.y, n.r + 5 * glow, 0, Math.PI * 2);
+                const ringAlpha = 0.08 * glow;
+                ctx.fillStyle = n.color.replace(')', `,${ringAlpha})`).replace('rgb', 'rgba');
+                // Simpler approach:
+                ctx.globalAlpha = 0.08 * glow;
+                ctx.fillStyle = n.color;
+                ctx.fill();
+                ctx.globalAlpha = 1;
+
+                // Core dot
+                ctx.beginPath(); ctx.arc(n.x, n.y, n.r, 0, Math.PI * 2);
+                ctx.fillStyle = n.color;
+                ctx.shadowColor = n.color;
+                ctx.shadowBlur = 10 + 10 * glow;
+                ctx.fill();
+                ctx.shadowBlur = 0;
+            }
+
+            // Floating hash labels
+            for (const f of floaters) {
+                f.y += f.vy;
+                if (f.y < -20) { f.y = canvas.height + 20; f.x = Math.random() * canvas.width; }
+                ctx.save();
+                ctx.globalAlpha = f.opacity;
+                ctx.fillStyle = f.color;
+                ctx.font = `${f.size}px 'JetBrains Mono', 'Courier New', monospace`;
+                ctx.shadowColor = f.color;
+                ctx.shadowBlur = 6;
+                ctx.fillText(f.text, f.x, f.y);
+                ctx.restore();
+            }
+
+            rafRef.current = requestAnimationFrame(animate);
+        };
+
+        animate();
+        return () => {
+            window.removeEventListener('resize', resize);
+            if (rafRef.current) cancelAnimationFrame(rafRef.current);
+        };
+    }, []);
+
+    return <canvas ref={canvasRef} style={{ position: 'fixed', inset: 0, zIndex: -2, pointerEvents: 'none' }} />;
+};
+
+/* ── Mouse spark trail ─────────────────────────────────────────────────── */
+const MouseTrail = () => {
+    const canvasRef = useRef(null);
+    const particles = useRef([]);
+    const rafRef = useRef(null);
+
+    useEffect(() => {
+        const canvas = canvasRef.current;
+        if (!canvas) return;
+        const ctx = canvas.getContext('2d');
+        const resize = () => { canvas.width = window.innerWidth; canvas.height = window.innerHeight; };
+        resize();
+        window.addEventListener('resize', resize);
+
+        const COLORS = ['#00f0ff', '#b44fff', '#00ff88', '#4f46e5', '#00f0ff'];
+
+        const onMove = (e) => {
+            for (let i = 0; i < 4; i++) {
+                particles.current.push({
+                    x: e.clientX, y: e.clientY,
+                    vx: (Math.random() - 0.5) * 3,
+                    vy: (Math.random() - 0.5) * 3 - 0.5,
+                    size: 1.5 + Math.random() * 5,
+                    opacity: 1,
+                    decay: 0.045 + Math.random() * 0.035,
+                    color: COLORS[Math.floor(Math.random() * COLORS.length)],
+                    gravity: 0.06,
+                });
+            }
+        };
+        window.addEventListener('mousemove', onMove);
+
+        const animate = () => {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            particles.current = particles.current.filter(p => p.opacity > 0.01);
+            for (const p of particles.current) {
+                ctx.save();
+                ctx.globalAlpha = p.opacity;
+                ctx.fillStyle = p.color;
+                ctx.shadowColor = p.color;
+                ctx.shadowBlur = 10;
+                ctx.beginPath();
+                ctx.arc(p.x, p.y, p.size, 0, Math.PI * 2);
+                ctx.fill();
+                ctx.restore();
+                p.x += p.vx; p.y += p.vy;
+                p.vy += p.gravity; p.opacity -= p.decay;
+            }
+            rafRef.current = requestAnimationFrame(animate);
+        };
+        animate();
+
+        return () => {
+            window.removeEventListener('resize', resize);
+            window.removeEventListener('mousemove', onMove);
+            if (rafRef.current) cancelAnimationFrame(rafRef.current);
+        };
+    }, []);
+
+    return <canvas ref={canvasRef} style={{ position: 'fixed', inset: 0, zIndex: 9999, pointerEvents: 'none' }} />;
+};
+
+/* ── Custom cursor ─────────────────────────────────────────────────────── */
+const CursorDot = () => {
+    const dotRef = useRef(null);
+    const ringRef = useRef(null);
+
+    useEffect(() => {
+        const dot = dotRef.current; const ring = ringRef.current;
+        if (!dot || !ring) return;
+        const move = (e) => {
+            dot.style.left = e.clientX + 'px'; dot.style.top = e.clientY + 'px';
+            ring.style.left = e.clientX + 'px'; ring.style.top = e.clientY + 'px';
+        };
+        const down = () => { dot.style.transform = 'translate(-50%,-50%) scale(1.8)'; };
+        const up = () => { dot.style.transform = 'translate(-50%,-50%) scale(1)'; };
+        window.addEventListener('mousemove', move);
+        window.addEventListener('mousedown', down);
+        window.addEventListener('mouseup', up);
+        return () => {
+            window.removeEventListener('mousemove', move);
+            window.removeEventListener('mousedown', down);
+            window.removeEventListener('mouseup', up);
+        };
+    }, []);
+
+    return (
+        <>
+            <div ref={dotRef} style={{
+                position: 'fixed', width: 10, height: 10, borderRadius: '50%',
+                background: '#00f0ff', boxShadow: '0 0 10px #00f0ff, 0 0 20px rgba(0,240,255,0.5)',
+                pointerEvents: 'none', zIndex: 99998, transform: 'translate(-50%,-50%)',
+                transition: 'transform .15s cubic-bezier(.34,1.56,.64,1)',
+            }} />
+            <div ref={ringRef} style={{
+                position: 'fixed', width: 32, height: 32, borderRadius: '50%',
+                border: '1.5px solid rgba(0,240,255,0.5)',
+                boxShadow: '0 0 8px rgba(0,240,255,0.2)',
+                pointerEvents: 'none', zIndex: 99997, transform: 'translate(-50%,-50%)',
+                transition: 'left .08s ease-out, top .08s ease-out',
+            }} />
+        </>
+    );
+};
+
+/* ── Main export ─────────────────────────────────────────────────────────── */
+const RainbowBackground = () => (
+    <>
+        <style>{`
+            body { cursor: none; }
+            .rb-base {
+                position: fixed; inset: 0; z-index: -3;
+                background:
+                    radial-gradient(ellipse 80% 60% at 10% 20%, rgba(0,240,255,0.06), transparent),
+                    radial-gradient(ellipse 60% 50% at 90% 80%, rgba(180,79,255,0.07), transparent),
+                    radial-gradient(ellipse 50% 70% at 50% 50%, rgba(0,255,136,0.03), transparent),
+                    linear-gradient(180deg, #020818 0%, #060d1f 50%, #020818 100%);
+                animation: bgBreath 12s ease-in-out infinite alternate;
+            }
+            @keyframes bgBreath {
+                0%   { opacity: 0.9; }
+                100% { opacity: 1; }
+            }
+        `}</style>
+
+        <div className="rb-base" />
+        <BlockchainCanvas />
+        <MouseTrail />
+        <CursorDot />
+    </>
+);
+
+export default RainbowBackground;
+
+
+
+======================================================================
+
+FILE: frontend\src\components\LandingPage.jsx
+
+EXPLANATION: The home page component. Shows project intro and large buttons to go to the Verifier or Admin portals.
+
+======================================================================
+
+
+import React from 'react';
+import { Link } from 'react-router-dom';
+
+const FLOW_STEPS = [
+    { icon: '📤', label: 'Admin Upload' },
+    { icon: '🔐', label: 'Generate Hash' },
+    { icon: '📦', label: 'Store on Chain' },
+    { icon: '🖼️', label: 'User Upload' },
+    { icon: '🔍', label: 'OCR Extract' },
+    { icon: '#️⃣', label: 'Hash Again' },
+    { icon: '⚖️', label: 'Compare' },
+    { icon: '✅', label: 'VALID / FAKE' },
+];
+
+const FEATURES = [
+    {
+        icon: '🔗',
+        title: 'Certificate Issuance',
+        color: '#00f0ff',
+        desc: 'Admin uploads certificates which are hashed, stored on IPFS, and registered immutably on the blockchain.',
+        link: '/admin',
+        linkText: 'Admin Portal',
+    },
+    {
+        icon: '🛡️',
+        title: 'Image Verification',
+        color: '#b44fff',
+        desc: 'Upload a certificate image — the system uses OCR + SHA-256 hashing to verify against the blockchain.',
+        link: '/verify',
+        linkText: 'Verify Image',
+    },
+    {
+        icon: '📱',
+        title: 'QR Verification',
+        color: '#00ff88',
+        desc: 'Scan the QR code on a certificate or enter the ID to instantly fetch verified details.',
+        link: '/verify',
+        linkText: 'Scan QR Code',
+    },
+];
+
+const STATS = [
+    { value: 'SHA-256', label: 'Hashing Algorithm' },
+    { value: '0ms', label: 'Trusted Delay' },
+    { value: '100%', label: 'On-Chain Proof' },
+    { value: 'EVM', label: 'Smart Contract' },
+];
+
+const LandingPage = () => (
+    <div className="landing-page page-enter" style={{ paddingBottom: '5rem' }}>
+
+        {/* ── Hero ──────────────────────────────────────────────────── */}
+        <section style={{ textAlign: 'center', padding: '5rem 0 3rem' }}>
+            {/* Badge */}
+            <div style={{
+                display: 'inline-flex', alignItems: 'center', gap: '0.5rem',
+                background: 'rgba(0,240,255,0.08)', border: '1px solid rgba(0,240,255,0.2)',
+                padding: '0.45rem 1.2rem', borderRadius: 50, marginBottom: '2rem',
+                fontSize: '0.85rem', color: '#00f0ff', fontWeight: 600, letterSpacing: '0.04em',
+                boxShadow: '0 0 20px rgba(0,240,255,0.1)',
+                animation: 'badgePulse 3s ease-in-out infinite',
+            }}>
+                <span style={{ width: 8, height: 8, borderRadius: '50%', background: '#00f0ff', display: 'inline-block', boxShadow: '0 0 8px #00f0ff', animation: 'dotBlink 1.5s ease-in-out infinite' }} />
+                BLOCKCHAIN-POWERED VERIFICATION
+            </div>
+
+            <h1 style={{ fontSize: '4rem', marginBottom: '1.25rem', letterSpacing: '-0.04em', lineHeight: 1.1 }}>
+                <span className="gradient-text">Verify Certificates</span><br />
+                <span style={{ color: '#e8f4ff', fontSize: '3rem' }}>on the Blockchain</span>
+            </h1>
+
+            <p style={{ maxWidth: '580px', margin: '0 auto 2.5rem', fontSize: '1.05rem', color: '#5a7a99', lineHeight: 1.8 }}>
+                Decentralized certificate verification using SHA-256 hashing,
+                IPFS storage, OCR extraction, and Ethereum smart contracts.
+            </p>
+
+            <div style={{ display: 'flex', gap: '1rem', justifyContent: 'center' }}>
+                <Link to="/verify" className="btn btn-primary btn-lg">🔍 Verify Certificate</Link>
+                <Link to="/admin" className="btn btn-secondary btn-lg">⛓ Admin Portal</Link>
+            </div>
+        </section>
+
+        {/* ── Stats row ─────────────────────────────────────────────── */}
+        <section style={{
+            display: 'grid', gridTemplateColumns: 'repeat(4,1fr)', gap: '1rem',
+            margin: '1rem 0 4rem',
+        }}>
+            {STATS.map((s, i) => (
+                <div key={i} style={{
+                    textAlign: 'center', padding: '1.25rem',
+                    background: 'rgba(0,240,255,0.03)', border: '1px solid rgba(0,240,255,0.10)',
+                    borderRadius: 14, transition: 'all .25s ease',
+                }}
+                    onMouseEnter={e => { e.currentTarget.style.borderColor = 'rgba(0,240,255,0.3)'; e.currentTarget.style.background = 'rgba(0,240,255,0.06)'; }}
+                    onMouseLeave={e => { e.currentTarget.style.borderColor = 'rgba(0,240,255,0.10)'; e.currentTarget.style.background = 'rgba(0,240,255,0.03)'; }}
+                >
+                    <div style={{ fontSize: '1.6rem', fontWeight: 800, fontFamily: "'JetBrains Mono', monospace", color: '#00f0ff', textShadow: '0 0 20px rgba(0,240,255,0.5)', marginBottom: '0.25rem' }}>{s.value}</div>
+                    <div style={{ fontSize: '0.78rem', color: '#5a7a99', textTransform: 'uppercase', letterSpacing: '0.08em' }}>{s.label}</div>
+                </div>
+            ))}
+        </section>
+
+        {/* ── System Flow ───────────────────────────────────────────── */}
+        <section style={{ textAlign: 'center', marginBottom: '4rem' }}>
+            <div style={{ marginBottom: '1.75rem' }}>
+                <span style={{
+                    fontSize: '0.72rem', fontWeight: 700, color: '#5a7a99',
+                    letterSpacing: '0.15em', textTransform: 'uppercase',
+                }}>OVERALL SYSTEM FLOW</span>
+            </div>
+            <div className="flow-diagram">
+                {FLOW_STEPS.map((step, i) => (
+                    <React.Fragment key={i}>
+                        <div className="flow-node">
+                            <span className="node-icon">{step.icon}</span>
+                            <span style={{ fontWeight: 600, fontSize: '0.78rem', color: '#a8c4e0' }}>{step.label}</span>
+                        </div>
+                        {i < FLOW_STEPS.length - 1 && (
+                            <div style={{ color: '#2d4a66', fontSize: '1.1rem', userSelect: 'none' }}>›</div>
+                        )}
+                    </React.Fragment>
+                ))}
+            </div>
+        </section>
+
+        {/* ── Feature cards ─────────────────────────────────────────── */}
+        <section>
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3,1fr)', gap: '1.5rem', alignItems: 'stretch' }}>
+                {FEATURES.map((feat, i) => (
+                    <div key={i} className="glass-panel" style={{
+                        textAlign: 'center', display: 'flex', flexDirection: 'column', alignItems: 'center',
+                    }}>
+                        {/* Neon icon circle */}
+                        <div style={{
+                            width: 64, height: 64, borderRadius: '50%', marginBottom: '1.25rem',
+                            background: `rgba(${feat.color === '#00f0ff' ? '0,240,255' : feat.color === '#b44fff' ? '180,79,255' : '0,255,136'},0.08)`,
+                            border: `1.5px solid ${feat.color}30`,
+                            display: 'flex', alignItems: 'center', justifyContent: 'center',
+                            fontSize: '1.8rem',
+                            boxShadow: `0 0 20px ${feat.color}20`,
+                            transition: 'all .3s ease',
+                        }}
+                            onMouseEnter={e => { e.currentTarget.style.boxShadow = `0 0 30px ${feat.color}50`; e.currentTarget.style.borderColor = feat.color; }}
+                            onMouseLeave={e => { e.currentTarget.style.boxShadow = `0 0 20px ${feat.color}20`; e.currentTarget.style.borderColor = `${feat.color}30`; }}
+                        >{feat.icon}</div>
+
+                        <h3 style={{ marginBottom: '0.75rem', color: feat.color, fontWeight: 700 }}>{feat.title}</h3>
+                        <p style={{ fontSize: '0.88rem', marginBottom: '1.5rem', flex: 1, color: '#5a7a99' }}>{feat.desc}</p>
+
+                        <Link to={feat.link} className="btn btn-sm" style={{
+                            width: '100%', marginTop: 'auto',
+                            color: feat.color, borderColor: feat.color,
+                            border: `1.5px solid ${feat.color}`,
+                            background: 'transparent',
+                            fontSize: '0.85rem', fontWeight: 600,
+                            boxShadow: `0 0 12px ${feat.color}20`,
+                            transition: 'all .25s ease',
+                        }}
+                            onMouseEnter={e => { e.currentTarget.style.background = feat.color; e.currentTarget.style.color = '#020818'; e.currentTarget.style.boxShadow = `0 0 25px ${feat.color}60`; }}
+                            onMouseLeave={e => { e.currentTarget.style.background = 'transparent'; e.currentTarget.style.color = feat.color; e.currentTarget.style.boxShadow = `0 0 12px ${feat.color}20`; }}
+                        >{feat.linkText}</Link>
+                    </div>
+                ))}
+            </div>
+        </section>
+
+        <style>{`
+            @keyframes badgePulse {
+                0%,100% { box-shadow: 0 0 15px rgba(0,240,255,0.1); }
+                50%      { box-shadow: 0 0 30px rgba(0,240,255,0.2); }
+            }
+            @keyframes dotBlink {
+                0%,100% { opacity:1; } 50% { opacity:0.3; }
+            }
+        `}</style>
+    </div>
+);
+
+export default LandingPage;
+
+
+
+======================================================================
+
+FILE: frontend\src\components\AdminDashboard.jsx
+
+EXPLANATION: The Administrator portal. Checks if the connected MetaMask user is the Admin. Allows uploading a certificate to issue to the blockchain.
+
+======================================================================
+
+
+import React, { useState, useRef, useCallback } from 'react';
+import { ethers } from 'ethers';
+
+const ALGO_STEPS = [
+    { num: 1, label: 'Start' },
+    { num: 2, label: 'Upload & hash certificate' },
+    { num: 3, label: 'Upload to IPFS' },
+    { num: 4, label: 'Awaiting MetaMask Approval' },
+    { num: 5, label: 'Store on Blockchain' },
+    { num: 6, label: 'End' },
+];
+
+const AdminDashboard = ({ walletAddress, account }) => {
+    // Support both prop names
+    const connectedAddress = walletAddress || account || null;
+    const [form, setForm] = useState({ studentName: '', course: '', certificateId: '' });
+    const [file, setFile] = useState(null);
+    const [loading, setLoading] = useState(false);
+    const [result, setResult] = useState(null);
+    const [error, setError] = useState('');
+    const [currentStep, setCurrentStep] = useState(-1);
+    const [completedSteps, setCompletedSteps] = useState([]);
+    const [isDragOver, setIsDragOver] = useState(false);
+    const fileInputRef = useRef(null);
+
+    const handleChange = e => setForm({ ...form, [e.target.name]: e.target.value });
+
+    const handleFileSelect = useCallback((selectedFile) => {
+        if (!selectedFile) return;
+        const allowed = ['image/png', 'image/jpeg', 'image/jpg', 'image/webp', 'application/pdf'];
+        if (!allowed.includes(selectedFile.type)) {
+            setError('Please upload an image (PNG, JPG, WEBP) or PDF file.');
+            return;
+        }
+        setFile(selectedFile);
+        setError('');
+        setResult(null);
+        setCurrentStep(-1);
+        setCompletedSteps([]);
+    }, []);
+
+    // ── Drag & Drop handlers ─────────────────────────────────────────────────
+    const handleDragEnter = useCallback((e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        setIsDragOver(true);
+    }, []);
+
+    const handleDragLeave = useCallback((e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        // Only clear if leaving the dropzone itself (not a child)
+        if (!e.currentTarget.contains(e.relatedTarget)) {
+            setIsDragOver(false);
+        }
+    }, []);
+
+    const handleDragOver = useCallback((e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        e.dataTransfer.dropEffect = 'copy';
+    }, []);
+
+    const handleDrop = useCallback((e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        setIsDragOver(false);
+        const dropped = e.dataTransfer.files?.[0];
+        if (dropped) handleFileSelect(dropped);
+    }, [handleFileSelect]);
+
+    const animateStep = (stepIndex) => {
+        return new Promise(resolve => {
+            setCurrentStep(stepIndex);
+            setTimeout(() => {
+                setCompletedSteps(prev => [...prev, stepIndex]);
+                resolve();
+            }, 500);
+        });
+    };
+
+    const handleSubmit = async e => {
+        e.preventDefault();
+        if (!connectedAddress) { setError('Please connect your MetaMask wallet using the button in the top right to issue certificates.'); return; }
+        if (!file) { setError('Please select a certificate file.'); return; }
+        setLoading(true);
+        setError('');
+        setResult(null);
+        setCurrentStep(-1);
+        setCompletedSteps([]);
+
+        try {
+            await animateStep(0); // Start
+            await animateStep(1); // Upload & Hash
+
+            const data = new FormData();
+            Object.entries(form).forEach(([k, v]) => data.append(k, v));
+            data.append('certificate', file);
+
+            // Step 1: Prepare data via backend (Hash + IPFS)
+            const resp = await fetch('http://localhost:5000/api/admin/prepare-issue', {
+                method: 'POST',
+                body: data,
+            });
+            const prepJson = await resp.json();
+            if (!prepJson.success) throw new Error(prepJson.error || 'Failed to prepare certificate');
+
+            await animateStep(2); // Upload to IPFS
+
+            // Step 2: Get Contract Info (Address + ABI)
+            const contractResp = await fetch('http://localhost:5000/api/contract-info');
+            const contractInfo = await contractResp.json();
+            if (!contractInfo.success) throw new Error('Failed to load contract specifics');
+
+            await animateStep(3); // Await MetaMask
+
+            // Step 3: Trigger MetaMask Transaction
+            if (!window.ethereum) throw new Error("MetaMask is not installed. Please install it to continue.");
+            const provider = new ethers.BrowserProvider(window.ethereum);
+            const signer = await provider.getSigner();
+            const contract = new ethers.Contract(contractInfo.address, contractInfo.abi, signer);
+
+            // Send transaction
+            const tx = await contract.issueCertificate(
+                prepJson.fileHash,
+                form.certificateId,
+                form.studentName,
+                form.course,
+                prepJson.ipfsHash
+            );
+
+            await animateStep(4); // Store on Blockchain (Mining)
+
+            // Wait for confirmation
+            const receipt = await tx.wait();
+
+            await animateStep(5); // End
+
+            setResult({
+                certificateId: form.certificateId,
+                fileHash: prepJson.fileHash,
+                ipfsHash: prepJson.ipfsHash,
+                transactionHash: receipt.hash,
+                qrCode: prepJson.qrCode
+            });
+            setForm({ studentName: '', course: '', certificateId: '' });
+            setFile(null);
+            if (fileInputRef.current) fileInputRef.current.value = '';
+
+        } catch (err) {
+            console.error(err);
+            if (err.message.includes('user rejected')) {
+                setError('Transaction was rejected in MetaMask.');
+            } else if (err.message.includes('missing revert data')) {
+                setError('Transaction failed. Make sure you are connected as the Admin account.');
+            } else {
+                setError(err.reason || err.message || 'Cannot process transaction. Check console logs.');
+            }
+            setCurrentStep(-1);
+        } finally {
+            setLoading(false);
+        }
+    };
+
+    const getStepState = (index) => {
+        if (completedSteps.includes(index)) return 'completed';
+        if (currentStep === index) return 'active';
+        return '';
+    };
+
+    const formatFileSize = (bytes) => {
+        if (bytes < 1024) return `${bytes} B`;
+        if (bytes < 1048576) return `${(bytes / 1024).toFixed(1)} KB`;
+        return `${(bytes / 1048576).toFixed(1)} MB`;
+    };
+
+    const fileIcon = file?.type === 'application/pdf' ? '📄' : '🖼️';
+
+    return (
+        <div className="admin-page page-enter">
+            <div className="page-header" style={{ textAlign: 'center', marginBottom: '1.5rem' }}>
+                <h2 className="gradient-text">Admin Portal</h2>
+                <p>Issue new certificates on the blockchain</p>
+
+                {/* Wallet status banner */}
+                {connectedAddress ? (
+                    <div style={{
+                        display: 'inline-flex', alignItems: 'center', gap: '0.6rem',
+                        marginTop: '0.85rem', padding: '0.5rem 1.1rem',
+                        background: 'rgba(5,150,105,0.08)', border: '1.5px solid rgba(5,150,105,0.25)',
+                        borderRadius: 50, fontSize: '0.85rem',
+                    }}>
+                        <img src="https://upload.wikimedia.org/wikipedia/commons/3/36/MetaMask_Fox.svg" alt="MetaMask" width={18} height={18} style={{ borderRadius: 4 }} />
+                        <span style={{ fontWeight: 600, color: '#065f46' }}>MetaMask Connected</span>
+                        <span style={{ fontFamily: 'monospace', color: '#059669', fontSize: '0.82rem' }}>
+                            {connectedAddress.slice(0, 8)}…{connectedAddress.slice(-6)}
+                        </span>
+                        <span style={{ width: 8, height: 8, borderRadius: '50%', background: '#22c55e', boxShadow: '0 0 6px #22c55e', display: 'inline-block' }} />
+                    </div>
+                ) : (
+                    <div style={{
+                        display: 'inline-flex', alignItems: 'center', gap: '0.5rem',
+                        marginTop: '0.85rem', padding: '0.5rem 1.1rem',
+                        background: 'rgba(217,119,6,0.08)', border: '1.5px solid rgba(217,119,6,0.25)',
+                        borderRadius: 50, fontSize: '0.82rem', color: '#92400e', fontWeight: 500,
+                    }}>
+                        ⚠️ No wallet connected — connect via the top-right button
+                    </div>
+                )}
+            </div>
+
+            {/* 7-Step Algorithm Stepper */}
+            <div className="algo-stepper">
+                {ALGO_STEPS.map((step, i) => (
+                    <React.Fragment key={i}>
+                        <div className={`algo-step ${getStepState(i)}`}>
+                            <div className="step-number">
+                                {completedSteps.includes(i) ? '✓' : step.num}
+                            </div>
+                            <span className="step-label">{step.label}</span>
+                        </div>
+                        {i < ALGO_STEPS.length - 1 && (
+                            <div className={`step-connector ${completedSteps.includes(i) ? 'completed' : ''}`} />
+                        )}
+                    </React.Fragment>
+                ))}
+            </div>
+
+            <div className="glass-panel">
+                <h3 style={{ marginBottom: '0.5rem' }}>Issue a New Certificate</h3>
+                <p style={{ marginBottom: '2rem', fontSize: '0.9rem' }}>
+                    Upload a student's certificate. The system will hash it, pin it to IPFS, and register it immutably on the blockchain.
+                </p>
+
+                <form onSubmit={handleSubmit}>
+                    <div className="form-group">
+                        <label className="form-label">Student Name</label>
+                        <input className="form-input" type="text" name="studentName"
+                            value={form.studentName} onChange={handleChange}
+                            placeholder="e.g. Alice Johnson" required />
+                    </div>
+                    <div className="form-group">
+                        <label className="form-label">Course Title</label>
+                        <input className="form-input" type="text" name="course"
+                            value={form.course} onChange={handleChange}
+                            placeholder="e.g. B.Tech Computer Science" required />
+                    </div>
+                    <div className="form-group">
+                        <label className="form-label">Certificate ID</label>
+                        <input className="form-input" type="text" name="certificateId"
+                            value={form.certificateId} onChange={handleChange}
+                            placeholder="e.g. CERT-2024-0042" required />
+                    </div>
+
+                    {/* ── Drag & Drop Dropzone ── */}
+                    <div className="form-group">
+                        <label className="form-label">Upload Certificate (Image or PDF)</label>
+                        <div
+                            className={`dropzone ${isDragOver ? 'drag-over' : ''} ${file && !isDragOver ? 'has-file' : ''}`}
+                            onClick={() => fileInputRef.current?.click()}
+                            onDragEnter={handleDragEnter}
+                            onDragLeave={handleDragLeave}
+                            onDragOver={handleDragOver}
+                            onDrop={handleDrop}
+                        >
+                            <input
+                                ref={fileInputRef}
+                                id="cert-file-input"
+                                type="file"
+                                accept="image/*,application/pdf"
+                                style={{ display: 'none' }}
+                                onChange={e => handleFileSelect(e.target.files[0])}
+                            />
+
+                            {isDragOver ? (
+                                <div className="dropzone-drag-content">
+                                    <span className="drop-icon" style={{ fontSize: '3.5rem' }}>🎯</span>
+                                    <h3 style={{ color: 'var(--primary-light)' }}>Drop it here!</h3>
+                                    <p>Release to upload</p>
+                                </div>
+                            ) : file ? (
+                                <div className="dropzone-file-content">
+                                    <span className="drop-icon">{fileIcon}</span>
+                                    <h3 style={{ color: 'var(--success)' }}>{file.name}</h3>
+                                    <p style={{ color: 'var(--text-muted)' }}>{formatFileSize(file.size)} — Click or drag to change</p>
+                                    <div className="file-type-badge">
+                                        {file.type === 'application/pdf' ? 'PDF' : 'IMAGE'}
+                                    </div>
+                                </div>
+                            ) : (
+                                <div className="dropzone-empty-content">
+                                    <span className="drop-icon">📤</span>
+                                    <h3>Drag & Drop or Click to Browse</h3>
+                                    <p>Supports PNG, JPG, WEBP, PDF</p>
+                                    <div className="dropzone-hint">
+                                        <span>🖱️ Click</span>
+                                        <span>or</span>
+                                        <span>📂 Drag file here</span>
+                                    </div>
+                                </div>
+                            )}
+                        </div>
+                    </div>
+
+                    <button type="submit" className="btn btn-primary btn-lg" style={{ width: '100%', background: !connectedAddress ? '#4a5568' : '', cursor: !connectedAddress ? 'not-allowed' : 'pointer' }} disabled={loading || !connectedAddress}>
+                        {loading ? (
+                            <><span className="loader"></span>Awaiting MetaMask / Processing...</>
+                        ) : !connectedAddress ? (
+                            '⚠️ Connect Wallet to Issue'
+                        ) : (
+                            '🔗 Sign & Issue to Blockchain'
+                        )}
+                    </button>
+                </form>
+
+                {error && (
+                    <div className="result-banner result-fake" style={{ marginTop: '1.5rem' }}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
+                            <span style={{ fontSize: '1.5rem' }}>❌</span>
+                            <div>
+                                <strong style={{ color: 'var(--error)' }}>Error</strong>
+                                <p style={{ margin: 0, color: 'var(--error)', fontSize: '0.9rem' }}>{error}</p>
+                            </div>
+                        </div>
+                    </div>
+                )}
+
+                {result && (
+                    <div className="result-banner result-valid" style={{ marginTop: '2rem' }}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', marginBottom: '1.5rem' }}>
+                            <span className="result-badge" style={{ 
+                                background: 'var(--success)', 
+                                color: '#fff', 
+                                padding: '0.4rem 1rem', 
+                                borderRadius: 'var(--radius-full)',
+                                fontWeight: 800,
+                                fontSize: '0.8rem'
+                            }}>✅ SUCCESS</span>
+                            <span style={{ color: 'var(--text-main)', fontWeight: 700, fontSize: '1.1rem' }}>Certificate registered on blockchain!</span>
+                        </div>
+                        <div style={{ background: 'rgba(0, 240, 255, 0.04)', backdropFilter: 'blur(10px)', borderRadius: 'var(--radius-md)', padding: '1.5rem', marginBottom: '1.25rem', border: '1px solid rgba(0, 240, 255, 0.1)', boxShadow: 'inset 0 0 20px rgba(0, 240, 255, 0.02)' }}>
+                            <div className="data-table">
+                                <div className="data-row"><span>Certificate ID</span><strong style={{ color: 'var(--primary)' }}>{result.certificateId}</strong></div>
+                                <div className="data-row"><span>File Hash</span><code className="hash">{result.fileHash}</code></div>
+                                <div className="data-row"><span>IPFS Hash</span><code className="hash">{result.ipfsHash}</code></div>
+                                <div className="data-row"><span>TX Hash</span><code className="hash">{result.transactionHash}</code></div>
+                            </div>
+                        </div>
+                        {result.qrCode && (
+                            <div className="qr-section">
+                                <p style={{ fontWeight: 600, color: 'var(--text-main)', marginBottom: '1rem' }}>QR Code for Quick Verification</p>
+                                <img src={result.qrCode} alt="Certificate QR Code" width={160} />
+                                <p style={{ fontSize: '0.78rem', color: 'var(--text-muted)', marginTop: '0.75rem' }}>Scan to verify this certificate instantly</p>
+                                <a href={result.qrCode} download={`qr-${result.certificateId}.png`} className="btn btn-outline btn-sm" style={{ marginTop: '0.75rem' }}>
+                                    ⬇ Download QR Code
+                                </a>
+                            </div>
+                        )}
+                        <div className="processing-log" style={{ marginTop: '1.25rem' }}>
+                            <div className="log-entry success">✓ SHA-256 hash generated: {result.fileHash?.substring(0, 24)}...</div>
+                            <div className="log-entry success">✓ Uploaded to IPFS: {result.ipfsHash?.substring(0, 24)}...</div>
+                            <div className="log-entry success">✓ Stored on Blockchain TX: {result.transactionHash?.substring(0, 24)}...</div>
+                            <div className="log-entry success">✓ QR Code generated for: {result.certificateId}</div>
+                        </div>
+                    </div>
+                )}
+            </div>
+        </div>
+    );
+};
+
+export default AdminDashboard;
+
+
+
+======================================================================
+
+FILE: frontend\src\components\VerificationPortal.jsx
+
+EXPLANATION: The Student/Verifier portal. Users can drag and drop a certificate to check if it has been tampered with or if it is authentic on the blockchain.
+
+======================================================================
+
+
+import React, { useState, useRef, useCallback } from 'react';
+
+const IMAGE_ALGO_STEPS = [
+    { num: 1, label: 'Start' },
+    { num: 2, label: 'Upload certificate image' },
+    { num: 3, label: 'Apply OCR (Tesseract)' },
+    { num: 4, label: 'Extract Certificate ID' },
+    { num: 5, label: 'Generate SHA-256 hash' },
+    { num: 6, label: 'Fetch from Blockchain' },
+    { num: 7, label: 'Compare hashes' },
+    { num: 8, label: 'Display result' },
+    { num: 9, label: 'End' },
+];
+
+const QR_ALGO_STEPS = [
+    { num: 1, label: 'Start' },
+    { num: 2, label: 'Scan QR Code' },
+    { num: 3, label: 'Extract Certificate ID' },
+    { num: 4, label: 'Fetch from Blockchain' },
+    { num: 5, label: 'Display details' },
+    { num: 6, label: 'End' },
+];
+
+const TABS = ['📄 Upload Image / PDF', '🔍 Verify by Certificate ID'];
+
+const VerificationPortal = () => {
+    const [tab, setTab] = useState(0);
+    const [file, setFile] = useState(null);
+    const [certId, setCertId] = useState('');
+    const [loading, setLoading] = useState(false);
+    const [result, setResult] = useState(null);
+    const [error, setError] = useState('');
+    const [currentStep, setCurrentStep] = useState(-1);
+    const [completedSteps, setCompletedSteps] = useState([]);
+    const [isDragOver, setIsDragOver] = useState(false);
+    const fileInputRef = useRef(null);
+
+    const reset = () => { setResult(null); setError(''); setCurrentStep(-1); setCompletedSteps([]); };
+
+    const handleFileSelect = useCallback((selectedFile) => {
+        if (!selectedFile) return;
+        const allowed = ['image/png', 'image/jpeg', 'image/jpg', 'image/webp', 'application/pdf'];
+        if (!allowed.includes(selectedFile.type)) {
+            setError('Please upload an image (PNG, JPG, WEBP) or PDF file.');
+            return;
+        }
+        setFile(selectedFile);
+        reset();
+    }, []);
+
+    const handleDragEnter = useCallback((e) => { e.preventDefault(); e.stopPropagation(); setIsDragOver(true); }, []);
+    const handleDragLeave = useCallback((e) => {
+        e.preventDefault(); e.stopPropagation();
+        if (!e.currentTarget.contains(e.relatedTarget)) setIsDragOver(false);
+    }, []);
+    const handleDragOver = useCallback((e) => { e.preventDefault(); e.stopPropagation(); e.dataTransfer.dropEffect = 'copy'; }, []);
+    const handleDrop = useCallback((e) => {
+        e.preventDefault(); e.stopPropagation(); setIsDragOver(false);
+        const dropped = e.dataTransfer.files?.[0];
+        if (dropped) handleFileSelect(dropped);
+    }, [handleFileSelect]);
+
+    const animateStep = (stepIndex) => new Promise(resolve => {
+        setCurrentStep(stepIndex);
+        setTimeout(() => { setCompletedSteps(prev => [...prev, stepIndex]); resolve(); }, 400);
+    });
+
+    const handleFileVerify = async e => {
+        e.preventDefault();
+        if (!file) { setError('Please select a file.'); return; }
+        setLoading(true); reset();
+        await animateStep(0); await animateStep(1); await animateStep(2);
+        const data = new FormData();
+        data.append('certificate', file);
+        try {
+            await animateStep(3); await animateStep(4);
+            const resp = await fetch('http://localhost:5000/api/verify', { method: 'POST', body: data });
+            const json = await resp.json();
+            await animateStep(5); await animateStep(6); await animateStep(7);
+            if (json.success) { await animateStep(8); setResult(json); }
+            else setError(json.error || 'Verification error');
+        } catch { setError('Cannot connect to backend. Is the server running?'); }
+        finally { setLoading(false); }
+    };
+
+    const handleQRVerify = async e => {
+        e.preventDefault();
+        if (!certId.trim()) { setError('Please enter a Certificate ID.'); return; }
+        setLoading(true); reset();
+        await animateStep(0); await animateStep(1); await animateStep(2);
+        try {
+            const resp = await fetch(`http://localhost:5000/api/verify-qr/${encodeURIComponent(certId.trim())}`);
+            const json = await resp.json();
+            await animateStep(3); await animateStep(4);
+            if (json.success) { await animateStep(5); setResult(json); }
+            else setError(json.error || 'Verification error');
+        } catch { setError('Cannot connect to backend. Is the server running?'); }
+        finally { setLoading(false); }
+    };
+
+    const getStepState = (index) => {
+        if (completedSteps.includes(index)) return 'completed';
+        if (currentStep === index) return 'active';
+        return '';
+    };
+
+    const activeSteps = tab === 0 ? IMAGE_ALGO_STEPS : QR_ALGO_STEPS;
+    const isValid = result?.isAuthentic;
+    const formatFileSize = (bytes) => {
+        if (bytes < 1024) return `${bytes} B`;
+        if (bytes < 1048576) return `${(bytes / 1024).toFixed(1)} KB`;
+        return `${(bytes / 1048576).toFixed(1)} MB`;
+    };
+    const fileIcon = file?.type === 'application/pdf' ? '📄' : '🖼️';
+
+    return (
+        <div className="verify-page page-enter">
+            <div className="page-header" style={{ textAlign: 'center', marginBottom: '1.5rem' }}>
+                <h2 className="gradient-text">Verify Certificate</h2>
+                <p>Upload an image for OCR+blockchain check, or enter a Certificate ID</p>
+            </div>
+
+            {/* Algorithm Stepper */}
+            <div className="algo-stepper" key={tab}>
+                {activeSteps.map((step, i) => (
+                    <React.Fragment key={i}>
+                        <div className={`algo-step ${getStepState(i)}`}>
+                            <div className="step-number">{completedSteps.includes(i) ? '✓' : step.num}</div>
+                            <span className="step-label">{step.label}</span>
+                        </div>
+                        {i < activeSteps.length - 1 && (
+                            <div className={`step-connector ${completedSteps.includes(i) ? 'completed' : ''}`} />
+                        )}
+                    </React.Fragment>
+                ))}
+            </div>
+
+            <div className="glass-panel">
+                <div style={{ textAlign: 'center', marginBottom: '1.5rem' }}>
+                    <h3 style={{ marginBottom: '0.5rem' }}>Verify Certificate Authenticity</h3>
+                    <p style={{ fontSize: '0.9rem' }}>
+                        Upload the certificate image/PDF for OCR+blockchain check, or enter a Certificate ID for instant lookup.
+                    </p>
+                </div>
+
+                {/* Tabs */}
+                <div className="tab-bar">
+                    {TABS.map((t, i) => (
+                        <button key={i} className={`tab-btn ${tab === i ? 'active' : ''}`}
+                            onClick={() => { setTab(i); reset(); setFile(null); setCertId(''); setIsDragOver(false); }}>
+                            {t}
+                        </button>
+                    ))}
+                </div>
+
+                {/* Tab 1: File Upload */}
+                {tab === 0 && (
+                    <form onSubmit={handleFileVerify} style={{ marginTop: '1rem' }}>
+                        <div
+                            className={`dropzone ${isDragOver ? 'drag-over' : ''} ${file && !isDragOver ? 'has-file' : ''}`}
+                            onClick={() => fileInputRef.current?.click()}
+                            onDragEnter={handleDragEnter} onDragLeave={handleDragLeave}
+                            onDragOver={handleDragOver} onDrop={handleDrop}
+                        >
+                            <input ref={fileInputRef} type="file" id="verify-file" accept="image/*,application/pdf"
+                                style={{ display: 'none' }} onChange={e => handleFileSelect(e.target.files[0])} />
+                            {isDragOver ? (
+                                <div className="dropzone-drag-content">
+                                    <span className="drop-icon" style={{ fontSize: '3.5rem' }}>🎯</span>
+                                    <h3 style={{ color: '#00f0ff' }}>Drop it here!</h3>
+                                    <p>Release to upload</p>
+                                </div>
+                            ) : file ? (
+                                <div className="dropzone-file-content">
+                                    <span className="drop-icon">{fileIcon}</span>
+                                    <h3 style={{ color: '#00ff88' }}>{file.name}</h3>
+                                    <p style={{ color: '#5a7a99' }}>{formatFileSize(file.size)} — Click or drag to change</p>
+                                    <div className="file-type-badge">{file.type === 'application/pdf' ? 'PDF' : 'IMAGE'}</div>
+                                </div>
+                            ) : (
+                                <div className="dropzone-empty-content">
+                                    <span className="drop-icon">📤</span>
+                                    <h3>Drag & Drop or Click to Browse</h3>
+                                    <p>Supports PNG, JPG, WEBP, PDF</p>
+                                    <div className="dropzone-hint">
+                                        <span>🖱️ Click</span><span>or</span><span>📂 Drag file here</span>
+                                    </div>
+                                </div>
+                            )}
+                        </div>
+                        <div style={{ textAlign: 'center', marginTop: '1.5rem' }}>
+                            <button type="submit" className="btn btn-primary btn-lg" disabled={loading} style={{ minWidth: 240 }}>
+                                {loading ? <><span className="loader"></span>Verifying...</> : '🔍 Verify Now'}
+                            </button>
+                        </div>
+                    </form>
+                )}
+
+                {/* Tab 2: Certificate ID */}
+                {tab === 1 && (
+                    <form onSubmit={handleQRVerify} style={{ marginTop: '1rem' }}>
+                        <div style={{
+                            textAlign: 'center', marginBottom: '1.5rem', padding: '1.5rem',
+                            background: 'rgba(0,240,255,0.03)', border: '1px solid rgba(0,240,255,0.10)', borderRadius: 12,
+                        }}>
+                            <div style={{ fontSize: '3rem', marginBottom: '0.75rem' }}>📷</div>
+                            <p style={{ marginBottom: '1.5rem', color: '#5a7a99', fontSize: '0.9rem' }}>
+                                Scan the QR code on the certificate, then paste the Certificate ID below. Or enter it manually.
+                            </p>
+                            <div className="form-group" style={{ textAlign: 'left', maxWidth: 420, margin: '0 auto' }}>
+                                <label className="form-label">Certificate ID</label>
+                                <input className="form-input" type="text" placeholder="e.g. CERT-2024-0042"
+                                    value={certId} onChange={e => { setCertId(e.target.value); reset(); }} required />
+                            </div>
+                        </div>
+                        <div style={{ textAlign: 'center' }}>
+                            <button type="submit" className="btn btn-primary btn-lg" disabled={loading} style={{ minWidth: 240 }}>
+                                {loading ? <><span className="loader"></span>Looking up...</> : '🔗 Fetch from Blockchain'}
+                            </button>
+                        </div>
+                    </form>
+                )}
+
+                {/* Error */}
+                {error && (
+                    <div className="result-banner result-fake" style={{ marginTop: '1.5rem' }}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
+                            <span style={{ fontSize: '1.5rem' }}>❌</span>
+                            <div>
+                                <strong style={{ color: '#ff3c3c' }}>Verification Error</strong>
+                                <p style={{ margin: 0, color: '#ff3c3c', fontSize: '0.9rem' }}>{error}</p>
+                            </div>
+                        </div>
+                    </div>
+                )}
+
+                {/* Result */}
+                {result && (
+                    <div className={`result-banner ${isValid ? 'result-valid' : 'result-fake'}`} style={{ marginTop: '2rem' }}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '1rem', marginBottom: '1.25rem', flexWrap: 'wrap' }}>
+                            <span style={{
+                                display: 'inline-flex', alignItems: 'center', gap: '0.4rem',
+                                padding: '0.35rem 0.9rem', borderRadius: 50,
+                                fontSize: '0.75rem', fontWeight: 800, letterSpacing: '0.05em',
+                                background: isValid ? 'rgba(0,255,136,0.15)' : 'rgba(255,60,60,0.15)',
+                                color: isValid ? '#00ff88' : '#ff3c3c',
+                                border: `1px solid ${isValid ? 'rgba(0,255,136,0.4)' : 'rgba(255,60,60,0.4)'}`,
+                            }}>
+                                {isValid ? '✅ VALID' : '❌ FAKE / TAMPERED'}
+                            </span>
+                            <p style={{ color: isValid ? '#00ff88' : '#ff3c3c', margin: 0, fontWeight: 500 }}>{result.message}</p>
+                        </div>
+
+                        {!isValid && result.reason && (
+                            <p style={{ color: '#ff3c3c', marginBottom: '1rem', fontSize: '0.9rem' }}>{result.reason}</p>
+                        )}
+
+                        {isValid && result.certificateData && (
+                            <div style={{
+                                background: 'rgba(0,240,255,0.04)',
+                                backdropFilter: 'blur(16px)',
+                                borderRadius: 14, padding: '1.5rem', marginBottom: '1.5rem',
+                                border: '1px solid rgba(0,240,255,0.15)',
+                                boxShadow: '0 0 30px rgba(0,240,255,0.06)',
+                                position: 'relative', overflow: 'hidden',
+                            }}>
+                                {/* HUD corner brackets */}
+                                <div style={{ position: 'absolute', top: 8, left: 8, width: 12, height: 12, borderTop: '2px solid rgba(0,240,255,0.6)', borderLeft: '2px solid rgba(0,240,255,0.6)', borderRadius: '2px 0 0 0' }} />
+                                <div style={{ position: 'absolute', bottom: 8, right: 8, width: 12, height: 12, borderBottom: '2px solid rgba(0,240,255,0.6)', borderRight: '2px solid rgba(0,240,255,0.6)', borderRadius: '0 0 2px 0' }} />
+                                <div className="data-table">
+                                    <div className="data-row">
+                                        <span>Student Name</span>
+                                        <strong style={{ color: '#e8f4ff' }}>{result.certificateData.studentName}</strong>
+                                    </div>
+                                    <div className="data-row">
+                                        <span>Course</span>
+                                        <strong style={{ color: '#e8f4ff' }}>{result.certificateData.course}</strong>
+                                    </div>
+                                    <div className="data-row">
+                                        <span>Certificate ID</span>
+                                        <code style={{ color: '#00f0ff', fontWeight: 700, fontFamily: "'JetBrains Mono',monospace", textShadow: '0 0 8px rgba(0,240,255,0.5)', fontSize: '0.85rem' }}>
+                                            {result.certificateData.certificateId}
+                                        </code>
+                                    </div>
+                                    <div className="data-row">
+                                        <span>IPFS Storage</span>
+                                        <code className="hash">{result.certificateData.ipfsHash}</code>
+                                    </div>
+                                    <div className="data-row">
+                                        <span>Status</span>
+                                        <strong style={{ color: '#00ff88', textShadow: '0 0 8px rgba(0,255,136,0.4)' }}>✅ Authenticated on Blockchain</strong>
+                                    </div>
+                                    <div className="data-row">
+                                        <span>Issued At</span>
+                                        <strong style={{ color: '#a8c4e0', fontFamily: "'JetBrains Mono',monospace", fontSize: '0.82rem' }}>
+                                            {result.certificateData.timestamp
+                                                ? new Date(Number(result.certificateData.timestamp) * 1000).toLocaleString()
+                                                : 'N/A'}
+                                        </strong>
+                                    </div>
+                                </div>
+                            </div>
+                        )}
+
+                        {result.generatedHash && (
+                            <div className="processing-log">
+                                <div className="log-entry success">✓ OCR scan completed</div>
+                                {result.extractedId && <div className="log-entry success">✓ Extracted ID: {result.extractedId}</div>}
+                                <div className="log-entry success">✓ SHA-256 hash: {result.generatedHash.substring(0, 28)}...</div>
+                                <div className="log-entry success">✓ Blockchain query complete</div>
+                                <div className="log-entry success">
+                                    ✓ Result: {isValid ? 'Hash MATCHED — Certificate is VALID' : 'Hash MISMATCH — Certificate is FAKE'}
+                                </div>
+                                {result.ocrMatch && result.ocrMatch !== 'N/A' && (
+                                    <div className="log-entry success">✓ OCR: {result.ocrMatch}</div>
+                                )}
+                            </div>
+                        )}
+                    </div>
+                )}
+            </div>
+        </div>
+    );
+};
+
+export default VerificationPortal;
+
+

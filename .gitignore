@@ -1,0 +1,36 @@
+# Git ignore file for CertifyChain
+
+# Dependencies
+node_modules/
+.pnp
+.pnp.js
+
+# Build outputs
+dist/
+build/
+compiled/
+artifacts/
+cache/
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# Mock IPFS storage
+backend/ipfs-data/
+
+# Temp / debug files
+hh_out.txt
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Tesseract trained data (large binary)
+*.traineddata
+
+# Editor
+.vscode/
+.idea/
