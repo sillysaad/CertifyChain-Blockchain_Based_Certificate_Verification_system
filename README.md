@@ -199,3 +199,9 @@ node server.js         # Starts API on port 5000
 cd frontend
 npm run dev            # Starts React on port 5173
 ```
+<img width="1903" height="939" alt="image" src="https://github.com/user-attachments/assets/7fd64f02-13af-4ccb-bb23-026ed1c7e934" />
+<img width="1902" height="939" alt="image" src="https://github.com/user-attachments/assets/a612d6ac-1b8e-480d-8087-ebc7ef3e35c4" />
+
+<p align="center">
+  ⭐ If you find this project interesting, consider giving the repository a star!
+</p>
